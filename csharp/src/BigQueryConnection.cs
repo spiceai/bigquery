@@ -53,6 +53,7 @@ namespace AdbcDrivers.BigQuery
     {
         readonly Dictionary<string, string> properties;
         readonly HttpClient httpClient;
+        const string ClassName = nameof(BigQueryConnection);
         const string infoDriverName = "ADBC BigQuery Driver";
         const string infoVendorName = "BigQuery";
         // Note: this needs to be set before the constructor runs
@@ -83,6 +84,11 @@ namespace AdbcDrivers.BigQuery
 
             this.httpClient = new HttpClient();
 
+            if (this.properties.TryGetValue(AdbcOptions.Telemetry.TraceParent, out string? traceParent) &&
+                !string.IsNullOrWhiteSpace(traceParent))
+            {
+                this.SetTraceParent(traceParent);
+            }
             if (this.properties.TryGetValue(BigQueryParameters.LargeDecimalsAsString, out string? sLargeDecimalsAsString) &&
                 bool.TryParse(sLargeDecimalsAsString, out bool largeDecimalsAsString))
             {
@@ -268,7 +274,7 @@ namespace AdbcDrivers.BigQuery
 
                 Client = client;
                 return client;
-            });
+            }, ClassName + "." + nameof(Open));
         }
 
         internal void SetCredential()
@@ -342,22 +348,32 @@ namespace AdbcDrivers.BigQuery
                 {
                     throw new ArgumentException($"{authenticationType} is not a valid authenticationType");
                 }
-            });
+            }, ClassName + "." + nameof(SetCredential));
         }
 
         public override void SetOption(string key, string value)
         {
             this.TraceActivity(activity =>
             {
-                activity?.AddTag(key + ".set", value);
-
                 this.properties[key] = value;
 
-                if (key.Equals(BigQueryParameters.AccessToken))
+                switch (key)
                 {
-                    UpdateClientToken();
+                    case BigQueryParameters.AccessToken:
+                        // Don't log the access token value, but do log that it was set
+                        activity?.AddTag(key + ".set", "***");
+                        UpdateClientToken();
+                        break;
+                    case AdbcOptions.Telemetry.TraceParent:
+                        activity?.AddTag(key + ".set", value);
+                        SetTraceParent(string.IsNullOrWhiteSpace(value) ? null : value);
+                        break;
+                    default:
+                        // TODO: Validate other options as they are set and throw if they are invalid
+                        // (for example, if the user tries to set a non-integer value for ClientTimeout)
+                        break;
                 }
-            });
+            }, ClassName + "." + nameof(SetOption));
         }
 
         /// <summary>
@@ -505,7 +521,7 @@ namespace AdbcDrivers.BigQuery
                 StandardSchemas.GetInfoSchema.Validate(dataArrays);
 
                 return new BigQueryInfoArrowStream(StandardSchemas.GetInfoSchema, dataArrays);
-            });
+            }, ClassName + "." + nameof(GetInfo));
         }
 
         public override IArrowArrayStream GetObjects(
@@ -529,7 +545,7 @@ namespace AdbcDrivers.BigQuery
                 {
                     throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
                 }
-            });
+            }, ClassName + "." + nameof(GetObjects));
         }
 
         /// <summary>
@@ -568,9 +584,16 @@ namespace AdbcDrivers.BigQuery
                 try
                 {
                     activity?.AddConditionalTag(SemanticConventions.Db.Query.Text, sql, IsSafeToTrace);
-
-                    Func<Task<BigQueryResults?>> func = () => Client.ExecuteQueryAsync(sql, parameters ?? Enumerable.Empty<BigQueryParameter>(), queryOptions, resultsOptions);
-                    BigQueryResults? result = ExecuteWithRetriesAsync<BigQueryResults?>(func, activity).GetAwaiter().GetResult();
+                    Task<BigQueryResults> func()
+                    {
+                        return this.TraceActivityAsync(async (activity) =>
+                        {
+                            BigQueryJob job = await Client.CreateQueryJobAsync(sql, parameters ?? Enumerable.Empty<BigQueryParameter>(), queryOptions);
+                            activity?.AddBigQueryTag("job_id", job.Reference.JobId);
+                            return await job.GetQueryResultsAsync(resultsOptions);
+                        }, ClassName + "." + nameof(ExecuteQuery) + "." + nameof(BigQueryJob.GetQueryResultsAsync));
+                    }
+                    BigQueryResults? result = ExecuteWithRetriesAsync(func, activity).GetAwaiter().GetResult();
 
                     return result;
                 }
@@ -578,7 +601,7 @@ namespace AdbcDrivers.BigQuery
                 {
                     throw new AdbcException(googleEx!.Message, AdbcStatusCode.Unauthorized, ex);
                 }
-            });
+            }, ClassName + "." + nameof(ExecuteQuery));
         }
 
         internal static bool IsUnauthorizedException(Exception ex, out GoogleApiException? googleEx)
@@ -648,7 +671,7 @@ namespace AdbcDrivers.BigQuery
                 StandardSchemas.GetObjectsSchema.Validate(dataArrays);
 
                 return dataArrays;
-            });
+            }, ClassName + "." + nameof(GetCatalogs));
         }
 
         private StructArray GetDbSchemas(
@@ -712,7 +735,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            });
+            }, ClassName + "." + nameof(GetDbSchemas));
         }
 
         private StructArray GetTableSchemas(
@@ -806,7 +829,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            });
+            }, ClassName + "." + nameof(GetTableSchemas));
         }
 
         private StructArray GetColumnSchema(
@@ -922,7 +945,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            });
+            }, ClassName + "." + nameof(GetColumnSchema));
         }
 
         private StructArray GetConstraintSchema(
@@ -994,7 +1017,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            });
+            }, ClassName + "." + nameof(GetConstraintSchema));
         }
 
         private StringArray GetConstraintColumnNames(
@@ -1022,7 +1045,7 @@ namespace AdbcDrivers.BigQuery
                 }
 
                 return constraintColumnNamesBuilder.Build();
-            });
+            }, ClassName + "." + nameof(GetConstraintColumnNames));
         }
 
         private StructArray GetConstraintsUsage(
@@ -1078,7 +1101,7 @@ namespace AdbcDrivers.BigQuery
                     length,
                     dataArrays,
                     nullBitmapBuffer.Build());
-            });
+            }, ClassName + "." + nameof(GetConstraintsUsage));
         }
 
         private string PatternToRegEx(string? pattern)
@@ -1196,7 +1219,7 @@ namespace AdbcDrivers.BigQuery
                 }
 
                 return new Schema(fields, null);
-            });
+            }, ClassName + "." + nameof(GetTableSchema));
         }
 
         private Field DescToField(BigQueryRow row)
