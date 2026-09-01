@@ -103,9 +103,9 @@ func (w *jobCancelWatch) wait() { <-w.finished }
 // that goes away — a cancelled statement, a closed connection, an abandoned
 // query — otherwise leaves the query running to completion.
 //
-// `abandoned` reports whether the job should be stopped when the watch is
-// released rather than because the context is done: `runQuery` can return with
-// a live context and a job still running, when polling its status fails.
+// `abandoned` reports whether the job may still be running, and is the only
+// thing that decides whether it is cancelled. It has to be safe to call from
+// this goroutine: the caller writes what it reports from its own.
 //
 // The cancel request cannot use ctx, which is already done in the common case,
 // so it gets a fresh context with its own timeout.
@@ -123,14 +123,15 @@ func watchJobForCancellation(
 		defer close(watch.finished)
 		select {
 		case <-watch.requested:
-			// Both channels can be ready at once — the query context is
-			// cancelled, runQuery returns, and its deferred stop fires before
-			// this goroutine is first scheduled — and select then picks between
-			// them at random. Decide on the state, not on the coin toss.
-			if ctx.Err() == nil && !abandoned() {
-				return
-			}
 		case <-ctx.Done():
+		}
+		// Decide on the job's state, not on which channel won. Both can be
+		// ready at once, and select picks between them at random; and a done
+		// context does not by itself mean the job is still running, since it can
+		// be cancelled while the results of a job that already finished are
+		// being read.
+		if !abandoned() {
+			return
 		}
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
 		defer cancel()
@@ -152,8 +153,10 @@ func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, e
 	// The job is running from here. It stays that way unless this function
 	// reaches a terminal status for it, so anything else that ends this call
 	// leaves work behind that has to be cancelled.
-	reachedTerminalStatus := false
-	watch := watchJobForCancellation(ctx, logger, job, func() bool { return !reachedTerminalStatus })
+	var reachedTerminalStatus atomic.Bool
+	watch := watchJobForCancellation(ctx, logger, job, func() bool {
+		return !reachedTerminalStatus.Load()
+	})
 	defer watch.stop()
 
 	// XXX: Google SDK badness.  We can't use Wait here because queries that
@@ -172,7 +175,7 @@ func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, e
 		// running and the deferred stop must cancel it.
 		return nil, -1, err
 	}
-	reachedTerminalStatus = true
+	reachedTerminalStatus.Store(true)
 
 	if err := js.Err(); err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "complete job")

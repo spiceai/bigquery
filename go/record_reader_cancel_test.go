@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -69,6 +70,12 @@ func quietLogger() *slog.Logger {
 
 func stillRunning() bool { return true }
 func alreadyDone() bool  { return false }
+
+// terminalAfter mirrors how runQuery shares the flag: written by the caller's
+// goroutine, read by the watch's.
+func terminalAfter(flag *atomic.Bool) func() bool {
+	return func() bool { return !flag.Load() }
+}
 
 func awaitCancel(t *testing.T, c *recordingCanceller) {
 	t.Helper()
@@ -159,6 +166,27 @@ func TestWatchStopDoesNotBlockOnAnInFlightCancel(t *testing.T) {
 	watch.wait()
 }
 
+// A context cancelled while the results of a job that already finished are being
+// read must not send jobs.cancel: the job is over, and the request would be both
+// pointless and misreported as a cancellation.
+func TestWatchDoesNotCancelAJobThatAlreadyFinished(t *testing.T) {
+	canceller := newRecordingCanceller(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var reachedTerminalStatus atomic.Bool
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, terminalAfter(&reachedTerminalStatus))
+
+	// safeWaitForJob has returned a terminal status; job.Read is next.
+	reachedTerminalStatus.Store(true)
+	cancel()
+	watch.stop()
+	watch.wait()
+
+	if calls, _ := canceller.observed(); calls != 0 {
+		t.Fatalf("jobs.cancel called %d times for a job that had already finished, want 0", calls)
+	}
+}
+
 // A failed cancel is reported, not retried or escalated: the query is already
 // beyond this client's reach.
 func TestWatchToleratesAFailedCancel(t *testing.T) {
@@ -176,8 +204,8 @@ func TestWatchToleratesAFailedCancel(t *testing.T) {
 	}
 }
 
-// A context that is already done must cancel the job even when the watch is
-// released at the same moment.
+// A context that is already done must cancel a job that is still running, even
+// when the watch is released at the same moment.
 //
 // Both channels are ready before the watching goroutine is first scheduled, so
 // deciding on the select alone loses the cancellation about half the time.
@@ -188,7 +216,7 @@ func TestWatchCancelsWhenStopRacesADoneContext(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		watch := watchJobForCancellation(ctx, quietLogger(), canceller, alreadyDone)
+		watch := watchJobForCancellation(ctx, quietLogger(), canceller, stillRunning)
 		watch.stop()
 		watch.wait()
 
