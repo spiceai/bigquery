@@ -28,6 +28,7 @@ type recordingCanceller struct {
 	mu         sync.Mutex
 	calls      int
 	hadError   error
+	block      chan struct{}
 	cancelled  chan struct{}
 	deadlineOK bool
 }
@@ -44,10 +45,14 @@ func (c *recordingCanceller) Cancel(ctx context.Context) error {
 	// The request must not inherit the context that was just cancelled, or it
 	// could never be delivered.
 	c.deadlineOK = ctx.Err() == nil
+	block := c.block
 	c.mu.Unlock()
 	select {
 	case c.cancelled <- struct{}{}:
 	default:
+	}
+	if block != nil {
+		<-block
 	}
 	return c.hadError
 }
@@ -62,20 +67,29 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+func stillRunning() bool { return true }
+func alreadyDone() bool  { return false }
+
+func awaitCancel(t *testing.T, c *recordingCanceller) {
+	t.Helper()
+	select {
+	case <-c.cancelled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job was never cancelled")
+	}
+}
+
 // A cancelled context must make the driver ask BigQuery to stop the job, on a
 // context that is still usable.
-func TestCancelJobOnContextDoneCancelsTheJob(t *testing.T) {
+func TestWatchCancelsWhenContextIsDone(t *testing.T) {
 	canceller := newRecordingCanceller(nil)
 	ctx, cancel := context.WithCancel(context.Background())
-	stop := cancelJobOnContextDone(ctx, quietLogger(), canceller)
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, stillRunning)
 
 	cancel()
-	select {
-	case <-canceller.cancelled:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the job was never cancelled after its context was done")
-	}
-	stop()
+	awaitCancel(t, canceller)
+	watch.stop()
+	watch.wait()
 
 	calls, deadlineOK := canceller.observed()
 	if calls != 1 {
@@ -86,58 +100,97 @@ func TestCancelJobOnContextDoneCancelsTheJob(t *testing.T) {
 	}
 }
 
-// A query that finishes normally must not have its job cancelled.
-func TestCancelJobOnContextDoneLeavesAFinishedQueryAlone(t *testing.T) {
+// A query that reached a terminal status must not have its job cancelled.
+func TestWatchLeavesAFinishedQueryAlone(t *testing.T) {
 	canceller := newRecordingCanceller(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	stop := cancelJobOnContextDone(ctx, quietLogger(), canceller)
-	stop()
-	// Cancelling after the watcher has stopped must not reach the job.
-	cancel()
-	time.Sleep(200 * time.Millisecond)
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, alreadyDone)
+	watch.stop()
+	watch.wait()
 
 	if calls, _ := canceller.observed(); calls != 0 {
-		t.Fatalf("jobs.cancel called %d times for a query that was not abandoned, want 0", calls)
+		t.Fatalf("jobs.cancel called %d times for a finished query, want 0", calls)
 	}
+}
+
+// Polling a job's status can fail while the job is still running. The context is
+// live in that path, so only the abandonment check can stop the job.
+func TestWatchCancelsAJobLeftRunningByAFailedPoll(t *testing.T) {
+	canceller := newRecordingCanceller(nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, stillRunning)
+	watch.stop()
+	awaitCancel(t, canceller)
+	watch.wait()
+
+	if calls, _ := canceller.observed(); calls != 1 {
+		t.Fatalf("jobs.cancel called %d times for a job left running, want 1", calls)
+	}
+}
+
+// Releasing the watch must not wait for a cancel already in flight: the caller
+// is unwinding because nobody is waiting any more, and jobs.cancel has its own
+// timeout.
+func TestWatchStopDoesNotBlockOnAnInFlightCancel(t *testing.T) {
+	canceller := newRecordingCanceller(nil)
+	canceller.block = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, stillRunning)
+	cancel()
+	awaitCancel(t, canceller)
+
+	returned := make(chan struct{})
+	go func() {
+		watch.stop()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop blocked while jobs.cancel was in flight")
+	}
+	close(canceller.block)
+	watch.wait()
 }
 
 // A failed cancel is reported, not retried or escalated: the query is already
 // beyond this client's reach.
-func TestCancelJobOnContextDoneToleratesAFailedCancel(t *testing.T) {
+func TestWatchToleratesAFailedCancel(t *testing.T) {
 	canceller := newRecordingCanceller(errors.New("cancel refused"))
 	ctx, cancel := context.WithCancel(context.Background())
-	stop := cancelJobOnContextDone(ctx, quietLogger(), canceller)
+	watch := watchJobForCancellation(ctx, quietLogger(), canceller, stillRunning)
 
 	cancel()
-	select {
-	case <-canceller.cancelled:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the job was never cancelled after its context was done")
-	}
-	stop()
+	awaitCancel(t, canceller)
+	watch.stop()
+	watch.wait()
 
 	if calls, _ := canceller.observed(); calls != 1 {
 		t.Fatalf("jobs.cancel called %d times, want 1", calls)
 	}
 }
 
-// A query context that is already done must cancel the job even when the
-// watcher is stopped at the same moment.
+// A context that is already done must cancel the job even when the watch is
+// released at the same moment.
 //
 // Both channels are ready before the watching goroutine is first scheduled, so
-// deciding on the select alone loses the cancellation about half the time —
-// exactly the abandonment this is meant to prevent. Repeated because the losing
-// side of that race is chosen at random.
-func TestCancelJobOnContextDoneCancelsWhenStopRacesADoneContext(t *testing.T) {
+// deciding on the select alone loses the cancellation about half the time.
+// Repeated because the losing side of that race is chosen at random.
+func TestWatchCancelsWhenStopRacesADoneContext(t *testing.T) {
 	for i := range 50 {
 		canceller := newRecordingCanceller(nil)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 
-		stop := cancelJobOnContextDone(ctx, quietLogger(), canceller)
-		stop()
+		watch := watchJobForCancellation(ctx, quietLogger(), canceller, alreadyDone)
+		watch.stop()
+		watch.wait()
 
 		if calls, _ := canceller.observed(); calls != 1 {
 			t.Fatalf("iteration %d: jobs.cancel called %d times for an abandoned query, want 1", i, calls)
