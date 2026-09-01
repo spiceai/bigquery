@@ -91,7 +91,14 @@ func cancelJobOnContextDone(ctx context.Context, logger *slog.Logger, job jobCan
 		defer close(done)
 		select {
 		case <-stop:
-			return
+			// Both channels can be ready at once — the query context is
+			// cancelled, runQuery returns, and its deferred stop fires before
+			// this goroutine is first scheduled — and select then picks between
+			// them at random. A cancelled context means the job may still be
+			// running, so decide on the context rather than on the coin toss.
+			if ctx.Err() == nil {
+				return
+			}
 		case <-ctx.Done():
 		}
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)

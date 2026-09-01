@@ -122,3 +122,25 @@ func TestCancelJobOnContextDoneToleratesAFailedCancel(t *testing.T) {
 		t.Fatalf("jobs.cancel called %d times, want 1", calls)
 	}
 }
+
+// A query context that is already done must cancel the job even when the
+// watcher is stopped at the same moment.
+//
+// Both channels are ready before the watching goroutine is first scheduled, so
+// deciding on the select alone loses the cancellation about half the time —
+// exactly the abandonment this is meant to prevent. Repeated because the losing
+// side of that race is chosen at random.
+func TestCancelJobOnContextDoneCancelsWhenStopRacesADoneContext(t *testing.T) {
+	for i := range 50 {
+		canceller := newRecordingCanceller(nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		stop := cancelJobOnContextDone(ctx, quietLogger(), canceller)
+		stop()
+
+		if calls, _ := canceller.observed(); calls != 1 {
+			t.Fatalf("iteration %d: jobs.cancel called %d times for an abandoned query, want 1", i, calls)
+		}
+	}
+}
