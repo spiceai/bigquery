@@ -29,6 +29,7 @@ import (
 	"log"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"cloud.google.com/go/bigquery"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -61,11 +62,63 @@ func checkContext(ctx context.Context, maybeErr error) error {
 	return ctx.Err()
 }
 
+// jobCancelTimeout bounds the jobs.cancel request itself. The context that
+// would normally bound it is the one that has just been cancelled.
+const jobCancelTimeout = 30 * time.Second
+
+// jobCanceller asks BigQuery to stop a job. Narrower than *bigquery.Job so the
+// watcher below can be tested without one.
+type jobCanceller interface {
+	ID() string
+	Cancel(ctx context.Context) error
+}
+
+// cancelJobOnContextDone asks BigQuery to stop the job as soon as ctx is done,
+// and returns a function that stops watching.
+//
+// Cancelling ctx only stops this client waiting. A BigQuery job outlives the
+// client that submitted it: it keeps consuming slots, and billing, until
+// something calls jobs.cancel. Nothing else in this driver does, so a caller
+// that goes away — a cancelled statement, a closed connection, an abandoned
+// query — otherwise leaves the query running to completion.
+//
+// The cancel request cannot use ctx, which is already done by the time it is
+// needed, so it gets a fresh context with its own timeout.
+func cancelJobOnContextDone(ctx context.Context, logger *slog.Logger, job jobCanceller) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+		}
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
+		defer cancel()
+		if err := job.Cancel(cancelCtx); err != nil {
+			logger.WarnContext(cancelCtx, "failed to cancel job, so it may keep running and billing until it finishes", "id", job.ID(), "error", err)
+			return
+		}
+		logger.DebugContext(cancelCtx, "cancelled job", "id", job.ID())
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
+}
+
 func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool) (bigquery.ArrowIterator, int64, error) {
 	job, err := query.Run(ctx)
 	if err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "run query")
 	}
+
+	// Watch only while the job could still be running: once this function
+	// returns, the job has reached a terminal state and there is nothing left to
+	// cancel.
+	stopCancelWatch := cancelJobOnContextDone(ctx, logger, job)
+	defer stopCancelWatch()
 
 	// XXX: Google SDK badness.  We can't use Wait here because queries that
 	// *fail* with a rateLimitExceeded (e.g. too many metadata operations)
