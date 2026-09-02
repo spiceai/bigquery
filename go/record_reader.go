@@ -28,6 +28,7 @@ import (
 	"errors"
 	"log"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 
 	"cloud.google.com/go/bigquery"
@@ -45,6 +46,7 @@ type reader struct {
 	chs        []chan arrow.RecordBatch
 	curChIndex int
 	rec        arrow.RecordBatch
+	errMu      sync.RWMutex
 	err        error
 
 	cancelFn context.CancelFunc
@@ -61,11 +63,19 @@ func checkContext(ctx context.Context, maybeErr error) error {
 	return ctx.Err()
 }
 
-func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool) (bigquery.ArrowIterator, int64, error) {
+func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool, st *statement) (bigquery.ArrowIterator, int64, error) {
+	// Parameterized execution reuses query, including its job ID policy.
+	jobIDConfig := query.JobIDConfig
+	defer func() { query.JobIDConfig = jobIDConfig }()
+
+	activeJob := st.beginJob(st.cnxn.client, &query.JobIDConfig)
+	defer st.finishJob(ctx, logger, activeJob)
+
 	job, err := query.Run(ctx)
 	if err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "run query")
 	}
+	activeJob.setJob(job)
 
 	// XXX: Google SDK badness.  We can't use Wait here because queries that
 	// *fail* with a rateLimitExceeded (e.g. too many metadata operations)
@@ -81,6 +91,7 @@ func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, e
 	if err != nil {
 		return nil, -1, err
 	}
+	activeJob.markFinished()
 
 	if err := js.Err(); err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "complete job")
@@ -167,8 +178,8 @@ func getQueryParameter(values arrow.RecordBatch, row int, parameterMode string) 
 	return parameters, nil
 }
 
-func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, alloc memory.Allocator, resultRecordBufferSize int) (bigqueryRdr *reader, totalRows int64, err error) {
-	arrowIterator, totalRows, err := runQuery(ctx, logger, query, false)
+func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, alloc memory.Allocator, resultRecordBufferSize int, st *statement) (bigqueryRdr *reader, totalRows int64, err error) {
+	arrowIterator, totalRows, err := runQuery(ctx, logger, query, false, st)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -189,7 +200,7 @@ func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Que
 		}
 	}()
 
-	bigqueryRdr = &reader{
+	result := &reader{
 		refCount:   1,
 		chs:        chs,
 		curChIndex: 0,
@@ -197,23 +208,30 @@ func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Que
 		cancelFn:   cancelFn,
 		schema:     schema,
 	}
+	bigqueryRdr = result
 
-	go func() {
-		defer rdr.Release()
-		for rdr.Next() && ctx.Err() == nil {
-			rec := rdr.RecordBatch()
-			rec.Retain()
-			ch <- rec
-		}
-
-		// TODO(lidavidm): doesn't this discard the error?
-		err = checkContext(ctx, rdr.Err())
-		defer close(ch)
-	}()
+	go streamRecordBatches(ctx, rdr, result, ch)
 	return bigqueryRdr, totalRows, nil
 }
 
-func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, group *errgroup.Group, query *bigquery.Query, rec arrow.RecordBatch, ch chan arrow.RecordBatch, parameterMode string, alloc memory.Allocator, rdrSchema func(schema *arrow.Schema)) (int64, error) {
+func streamRecordBatches(ctx context.Context, source array.RecordReader, result *reader, ch chan arrow.RecordBatch) {
+	defer close(ch)
+	defer source.Release()
+	for source.Next() && ctx.Err() == nil {
+		rec := source.RecordBatch()
+		rec.Retain()
+		select {
+		case ch <- rec:
+		case <-ctx.Done():
+			rec.Release()
+			result.setError(checkContext(ctx, nil))
+			return
+		}
+	}
+	result.setError(checkContext(ctx, source.Err()))
+}
+
+func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, group *errgroup.Group, query *bigquery.Query, rec arrow.RecordBatch, ch chan arrow.RecordBatch, parameterMode string, alloc memory.Allocator, rdrSchema func(schema *arrow.Schema), st *statement) (int64, error) {
 	totalRows := int64(-1)
 	for i := range int(rec.NumRows()) {
 		parameters, err := getQueryParameter(rec, i, parameterMode)
@@ -224,7 +242,7 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 			query.Parameters = parameters
 		}
 
-		arrowIterator, rows, err := runQuery(ctx, logger, query, false)
+		arrowIterator, rows, err := runQuery(ctx, logger, query, false, st)
 		if err != nil {
 			return -1, err
 		}
@@ -239,7 +257,12 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 			for rdr.Next() && ctx.Err() == nil {
 				rec := rdr.RecordBatch()
 				rec.Retain()
-				ch <- rec
+				select {
+				case ch <- rec:
+				case <-ctx.Done():
+					rec.Release()
+					return checkContext(ctx, nil)
+				}
 			}
 			return checkContext(ctx, rdr.Err())
 		})
@@ -249,9 +272,9 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 
 // kicks off a goroutine for each endpoint and returns a reader which
 // gathers all of the records as they come in.
-func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Query, boundParameters array.RecordReader, parameterMode string, alloc memory.Allocator, resultRecordBufferSize, prefetchConcurrency int) (bigqueryRdr *reader, totalRows int64, err error) {
+func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Query, boundParameters array.RecordReader, parameterMode string, alloc memory.Allocator, resultRecordBufferSize, prefetchConcurrency int, st *statement) (bigqueryRdr *reader, totalRows int64, err error) {
 	if boundParameters == nil {
-		return runPlainQuery(ctx, logger, query, alloc, resultRecordBufferSize)
+		return runPlainQuery(ctx, logger, query, alloc, resultRecordBufferSize, st)
 	}
 	defer boundParameters.Release()
 
@@ -289,13 +312,13 @@ func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Q
 		// we don't need to call rec.Retain() here and call call rec.Release() in queryRecordWithSchemaCallback
 		batchRows, err := queryRecordWithSchemaCallback(ctx, logger, group, query, rec, ch, parameterMode, alloc, func(schema *arrow.Schema) {
 			bigqueryRdr.schema = schema
-		})
+		}, st)
 		if err != nil {
 			return nil, -1, err
 		}
 		totalRows += batchRows
 	}
-	bigqueryRdr.err = group.Wait()
+	bigqueryRdr.setError(group.Wait())
 	defer close(ch)
 	return bigqueryRdr, totalRows, nil
 }
@@ -319,7 +342,15 @@ func (r *reader) Release() {
 }
 
 func (r *reader) Err() error {
+	r.errMu.RLock()
+	defer r.errMu.RUnlock()
 	return r.err
+}
+
+func (r *reader) setError(err error) {
+	r.errMu.Lock()
+	r.err = err
+	r.errMu.Unlock()
 }
 
 func (r *reader) Next() bool {

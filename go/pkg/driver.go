@@ -62,11 +62,12 @@ import (
 	"runtime"
 	"runtime/cgo"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/adbc-drivers/bigquery/go"
+	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/cdata"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -250,22 +251,43 @@ func exportBytesOption(val []byte, out *C.uint8_t, length *C.size_t) C.AdbcStatu
 }
 
 type cancellableContext struct {
+	mu     sync.Mutex
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 func (c *cancellableContext) newContext() context.Context {
-	c.cancelContext()
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	return c.ctx
+	c.mu.Lock()
+	previous := c.cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx, c.cancel = ctx, cancel
+	c.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
+	return ctx
 }
 
-func (c *cancellableContext) cancelContext() {
-	if c.cancel != nil {
-		c.cancel()
+func (c *cancellableContext) finishContext(ctx context.Context) {
+	// Do not clear a newer operation's context.
+	c.mu.Lock()
+	if c.ctx == ctx {
+		c.ctx = nil
+		c.cancel = nil
 	}
+	c.mu.Unlock()
+}
+
+func (c *cancellableContext) cancelContext() bool {
+	c.mu.Lock()
+	cancel := c.cancel
 	c.ctx = nil
 	c.cancel = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return cancel != nil
 }
 
 func checkDBAlloc(db *C.struct_AdbcDatabase, err *C.struct_AdbcError, fname string) bool {
@@ -1287,6 +1309,8 @@ func BigQueryConnectionRollback(cnxn *C.struct_AdbcConnection, err *C.struct_Adb
 
 type cStmt struct {
 	cancellableContext
+	// Non-execution calls must not make StatementCancel report success.
+	executionContext cancellableContext
 
 	stmt adbc.Statement
 }
@@ -1465,6 +1489,7 @@ func BigQueryStatementRelease(stmt *C.struct_AdbcStatement, err *C.struct_AdbcEr
 	st := h.Value().(*cStmt)
 	defer func() {
 		st.cancelContext()
+		st.executionContext.cancelContext()
 		st.stmt = nil
 		C.free(stmt.private_data)
 		stmt.private_data = nil
@@ -1495,7 +1520,23 @@ func BigQueryStatementCancel(stmt *C.struct_AdbcStatement, err *C.struct_AdbcErr
 		return C.ADBC_STATUS_INVALID_STATE
 	}
 
-	st.cancelContext()
+	active := st.executionContext.cancelContext()
+	canceler, ok := st.stmt.(statementCanceler)
+	if !ok {
+		if active {
+			return C.ADBC_STATUS_OK
+		}
+		setErr(err, "AdbcStatementCancel: no active query to cancel")
+		return C.ADBC_STATUS_INVALID_STATE
+	}
+
+	if e := canceler.Cancel(context.Background()); e != nil {
+		var adbcErr adbc.Error
+		if active && errors.As(e, &adbcErr) && adbcErr.Code == adbc.StatusInvalidState {
+			return C.ADBC_STATUS_OK
+		}
+		return C.AdbcStatusCode(errToAdbcErr(err, e))
+	}
 	return C.ADBC_STATUS_OK
 }
 
@@ -1527,7 +1568,9 @@ func BigQueryStatementExecuteQuery(stmt *C.struct_AdbcStatement, out *C.struct_A
 	}
 
 	if out == nil {
-		n, e := st.stmt.ExecuteUpdate(st.newContext())
+		ctx := st.executionContext.newContext()
+		defer st.executionContext.finishContext(ctx)
+		n, e := st.stmt.ExecuteUpdate(ctx)
 		if e != nil {
 			return C.AdbcStatusCode(errToAdbcErr(err, e))
 		}
@@ -1536,7 +1579,9 @@ func BigQueryStatementExecuteQuery(stmt *C.struct_AdbcStatement, out *C.struct_A
 			*affected = C.int64_t(n)
 		}
 	} else {
-		rdr, n, e := st.stmt.ExecuteQuery(st.newContext())
+		ctx := st.executionContext.newContext()
+		defer st.executionContext.finishContext(ctx)
+		rdr, n, e := st.stmt.ExecuteQuery(ctx)
 		if e != nil {
 			return C.AdbcStatusCode(errToAdbcErr(err, e))
 		}
@@ -1569,7 +1614,9 @@ func BigQueryStatementExecuteSchema(stmt *C.struct_AdbcStatement, schema *C.stru
 		return C.ADBC_STATUS_NOT_IMPLEMENTED
 	}
 
-	sc, e := es.ExecuteSchema(st.newContext())
+	ctx := st.executionContext.newContext()
+	defer st.executionContext.finishContext(ctx)
+	sc, e := es.ExecuteSchema(ctx)
 	if e != nil {
 		return C.AdbcStatusCode(errToAdbcErr(err, e))
 	}

@@ -63,6 +63,7 @@ type bigqueryBulkIngestImpl struct {
 	options     driverbase.BulkIngestOptions
 	queryConfig bigquery.QueryConfig
 	client      *bigquery.Client
+	statement   *statement
 
 	tmpdir string
 }
@@ -117,15 +118,19 @@ func (bi *bigqueryBulkIngestImpl) Copy(ctx context.Context, chunk driverbase.Bul
 	// storage and do a single upload.  That may or may not be preferable
 	// (less parallelism, but BigQuery itself will guarantee atomicity)
 	loader.CreateDisposition = bigquery.CreateNever
+	activeJob := bi.statement.beginJob(bi.client, &loader.JobIDConfig)
+	defer bi.statement.finishJob(ctx, bi.logger, activeJob)
 
 	job, err := loader.Run(ctx)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "run loader")
 	}
+	activeJob.setJob(job)
 	status, err := safeWaitForJob(ctx, bi.logger, job)
 	if err != nil {
 		return err
 	}
+	activeJob.markFinished()
 	if err := status.Err(); err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "load data")
 	}
