@@ -30,7 +30,6 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"cloud.google.com/go/bigquery"
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -47,6 +46,7 @@ type reader struct {
 	chs        []chan arrow.RecordBatch
 	curChIndex int
 	rec        arrow.RecordBatch
+	errMu      sync.RWMutex
 	err        error
 
 	cancelFn context.CancelFunc
@@ -63,101 +63,20 @@ func checkContext(ctx context.Context, maybeErr error) error {
 	return ctx.Err()
 }
 
-// jobCancelTimeout bounds the jobs.cancel request itself. The context that
-// would normally bound it is the one that has just been cancelled.
-const jobCancelTimeout = 30 * time.Second
+func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool, st *statement) (bigquery.ArrowIterator, int64, error) {
+	flight := st.beginJob(st.cnxn.client, &query.JobIDConfig)
+	defer st.endJob(flight)
 
-// jobCanceller asks BigQuery to stop a job. Narrower than *bigquery.Job so the
-// watcher below can be tested without one.
-type jobCanceller interface {
-	ID() string
-	Cancel(ctx context.Context) error
-}
+	watch := watchJobForCancellation(ctx, logger, flight, func() bool {
+		return !flight.finished.Load()
+	})
+	defer watch.stop()
 
-// jobCancelWatch stops a BigQuery job once nobody is waiting for it any more.
-type jobCancelWatch struct {
-	cancelOnce sync.Once
-	requested  chan struct{}
-	finished   chan struct{}
-}
-
-// stop releases the watch without waiting for a cancel already in flight.
-//
-// It must not block: on the cancellation path the caller is unwinding precisely
-// because nobody is waiting any more, and making it wait for jobs.cancel would
-// put that request's timeout back on the latency this change exists to remove.
-func (w *jobCancelWatch) stop() { w.cancelOnce.Do(func() { close(w.requested) }) }
-
-// cancelNow asks for the job to be stopped even though the context is still
-// live, for a caller that is abandoning the job for its own reasons.
-func (w *jobCancelWatch) cancelNow() { w.stop() }
-
-// wait blocks until the watch goroutine has finished. For tests.
-func (w *jobCancelWatch) wait() { <-w.finished }
-
-// watchJobForCancellation stops the job as soon as nobody is waiting for it.
-//
-// Cancelling ctx only stops this client waiting. A BigQuery job outlives the
-// client that submitted it: it keeps consuming slots, and billing, until
-// something calls jobs.cancel. Nothing else in this driver does, so a caller
-// that goes away — a cancelled statement, a closed connection, an abandoned
-// query — otherwise leaves the query running to completion.
-//
-// `abandoned` reports whether the job may still be running, and is the only
-// thing that decides whether it is cancelled. It has to be safe to call from
-// this goroutine: the caller writes what it reports from its own.
-//
-// The cancel request cannot use ctx, which is already done in the common case,
-// so it gets a fresh context with its own timeout.
-func watchJobForCancellation(
-	ctx context.Context,
-	logger *slog.Logger,
-	job jobCanceller,
-	abandoned func() bool,
-) *jobCancelWatch {
-	watch := &jobCancelWatch{
-		requested: make(chan struct{}),
-		finished:  make(chan struct{}),
-	}
-	go func() {
-		defer close(watch.finished)
-		select {
-		case <-watch.requested:
-		case <-ctx.Done():
-		}
-		// Decide on the job's state, not on which channel won. Both can be
-		// ready at once, and select picks between them at random; and a done
-		// context does not by itself mean the job is still running, since it can
-		// be cancelled while the results of a job that already finished are
-		// being read.
-		if !abandoned() {
-			return
-		}
-		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
-		defer cancel()
-		if err := job.Cancel(cancelCtx); err != nil {
-			logger.WarnContext(cancelCtx, "failed to cancel job, so it may keep running and billing until it finishes", "id", job.ID(), "error", err)
-			return
-		}
-		logger.DebugContext(cancelCtx, "cancelled job", "id", job.ID())
-	}()
-	return watch
-}
-
-func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool) (bigquery.ArrowIterator, int64, error) {
 	job, err := query.Run(ctx)
 	if err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "run query")
 	}
-
-	// The job is running from here. It stays that way unless this function
-	// reaches a terminal status for it, so anything else that ends this call
-	// leaves work behind that has to be cancelled.
-	var reachedTerminalStatus atomic.Bool
-	watch := watchJobForCancellation(ctx, logger, job, func() bool {
-		return !reachedTerminalStatus.Load()
-	})
-	defer watch.stop()
+	flight.setJob(job)
 
 	// XXX: Google SDK badness.  We can't use Wait here because queries that
 	// *fail* with a rateLimitExceeded (e.g. too many metadata operations)
@@ -171,11 +90,9 @@ func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, e
 	// their internal APIs mix both errors into a single error path.)
 	js, err := safeWaitForJob(ctx, logger, job)
 	if err != nil {
-		// Polling failed rather than the job finishing, so the job is still
-		// running and the deferred stop must cancel it.
 		return nil, -1, err
 	}
-	reachedTerminalStatus.Store(true)
+	flight.markFinished()
 
 	if err := js.Err(); err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "complete job")
@@ -262,8 +179,8 @@ func getQueryParameter(values arrow.RecordBatch, row int, parameterMode string) 
 	return parameters, nil
 }
 
-func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, alloc memory.Allocator, resultRecordBufferSize int) (bigqueryRdr *reader, totalRows int64, err error) {
-	arrowIterator, totalRows, err := runQuery(ctx, logger, query, false)
+func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, alloc memory.Allocator, resultRecordBufferSize int, st *statement) (bigqueryRdr *reader, totalRows int64, err error) {
+	arrowIterator, totalRows, err := runQuery(ctx, logger, query, false, st)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -284,7 +201,7 @@ func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Que
 		}
 	}()
 
-	bigqueryRdr = &reader{
+	result := &reader{
 		refCount:   1,
 		chs:        chs,
 		curChIndex: 0,
@@ -292,23 +209,30 @@ func runPlainQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Que
 		cancelFn:   cancelFn,
 		schema:     schema,
 	}
+	bigqueryRdr = result
 
-	go func() {
-		defer rdr.Release()
-		for rdr.Next() && ctx.Err() == nil {
-			rec := rdr.RecordBatch()
-			rec.Retain()
-			ch <- rec
-		}
-
-		// TODO(lidavidm): doesn't this discard the error?
-		err = checkContext(ctx, rdr.Err())
-		defer close(ch)
-	}()
+	go streamRecordBatches(ctx, rdr, result, ch)
 	return bigqueryRdr, totalRows, nil
 }
 
-func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, group *errgroup.Group, query *bigquery.Query, rec arrow.RecordBatch, ch chan arrow.RecordBatch, parameterMode string, alloc memory.Allocator, rdrSchema func(schema *arrow.Schema)) (int64, error) {
+func streamRecordBatches(ctx context.Context, source array.RecordReader, result *reader, ch chan arrow.RecordBatch) {
+	defer close(ch)
+	defer source.Release()
+	for source.Next() && ctx.Err() == nil {
+		rec := source.RecordBatch()
+		rec.Retain()
+		select {
+		case ch <- rec:
+		case <-ctx.Done():
+			rec.Release()
+			result.setError(checkContext(ctx, nil))
+			return
+		}
+	}
+	result.setError(checkContext(ctx, source.Err()))
+}
+
+func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, group *errgroup.Group, query *bigquery.Query, rec arrow.RecordBatch, ch chan arrow.RecordBatch, parameterMode string, alloc memory.Allocator, rdrSchema func(schema *arrow.Schema), st *statement) (int64, error) {
 	totalRows := int64(-1)
 	for i := range int(rec.NumRows()) {
 		parameters, err := getQueryParameter(rec, i, parameterMode)
@@ -319,7 +243,7 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 			query.Parameters = parameters
 		}
 
-		arrowIterator, rows, err := runQuery(ctx, logger, query, false)
+		arrowIterator, rows, err := runQuery(ctx, logger, query, false, st)
 		if err != nil {
 			return -1, err
 		}
@@ -334,7 +258,12 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 			for rdr.Next() && ctx.Err() == nil {
 				rec := rdr.RecordBatch()
 				rec.Retain()
-				ch <- rec
+				select {
+				case ch <- rec:
+				case <-ctx.Done():
+					rec.Release()
+					return checkContext(ctx, nil)
+				}
 			}
 			return checkContext(ctx, rdr.Err())
 		})
@@ -344,9 +273,9 @@ func queryRecordWithSchemaCallback(ctx context.Context, logger *slog.Logger, gro
 
 // kicks off a goroutine for each endpoint and returns a reader which
 // gathers all of the records as they come in.
-func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Query, boundParameters array.RecordReader, parameterMode string, alloc memory.Allocator, resultRecordBufferSize, prefetchConcurrency int) (bigqueryRdr *reader, totalRows int64, err error) {
+func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Query, boundParameters array.RecordReader, parameterMode string, alloc memory.Allocator, resultRecordBufferSize, prefetchConcurrency int, st *statement) (bigqueryRdr *reader, totalRows int64, err error) {
 	if boundParameters == nil {
-		return runPlainQuery(ctx, logger, query, alloc, resultRecordBufferSize)
+		return runPlainQuery(ctx, logger, query, alloc, resultRecordBufferSize, st)
 	}
 	defer boundParameters.Release()
 
@@ -384,13 +313,13 @@ func newRecordReader(ctx context.Context, logger *slog.Logger, query *bigquery.Q
 		// we don't need to call rec.Retain() here and call call rec.Release() in queryRecordWithSchemaCallback
 		batchRows, err := queryRecordWithSchemaCallback(ctx, logger, group, query, rec, ch, parameterMode, alloc, func(schema *arrow.Schema) {
 			bigqueryRdr.schema = schema
-		})
+		}, st)
 		if err != nil {
 			return nil, -1, err
 		}
 		totalRows += batchRows
 	}
-	bigqueryRdr.err = group.Wait()
+	bigqueryRdr.setError(group.Wait())
 	defer close(ch)
 	return bigqueryRdr, totalRows, nil
 }
@@ -414,7 +343,15 @@ func (r *reader) Release() {
 }
 
 func (r *reader) Err() error {
+	r.errMu.RLock()
+	defer r.errMu.RUnlock()
 	return r.err
+}
+
+func (r *reader) setError(err error) {
+	r.errMu.Lock()
+	r.err = err
+	r.errMu.Unlock()
 }
 
 func (r *reader) Next() bool {
