@@ -203,6 +203,20 @@ func TestExecutionBoundReaderFinishesAtEOF(t *testing.T) {
 	rdr.Release()
 }
 
+func TestExecutionBoundReaderFinishesAtRelease(t *testing.T) {
+	inner, err := array.NewRecordReader(arrow.NewSchema(nil, nil), nil)
+	require.NoError(t, err)
+	finished := make(chan struct{})
+	rdr := bindExecutionReader(inner, func() { close(finished) })
+
+	rdr.Release()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("execution remained active after reader release")
+	}
+}
+
 type acceptedJobServer struct {
 	t                  *testing.T
 	server             *httptest.Server
