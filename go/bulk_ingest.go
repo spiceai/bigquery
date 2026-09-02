@@ -118,23 +118,19 @@ func (bi *bigqueryBulkIngestImpl) Copy(ctx context.Context, chunk driverbase.Bul
 	// storage and do a single upload.  That may or may not be preferable
 	// (less parallelism, but BigQuery itself will guarantee atomicity)
 	loader.CreateDisposition = bigquery.CreateNever
-	flight := bi.statement.beginJob(bi.client, &loader.JobIDConfig)
-	defer bi.statement.endJob(flight)
-	watch := watchJobForCancellation(ctx, bi.logger, flight, func() bool {
-		return !flight.finished.Load()
-	})
-	defer watch.stop()
+	activeJob := bi.statement.beginJob(bi.client, &loader.JobIDConfig)
+	defer bi.statement.finishJob(ctx, bi.logger, activeJob)
 
 	job, err := loader.Run(ctx)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "run loader")
 	}
-	flight.setJob(job)
+	activeJob.setJob(job)
 	status, err := safeWaitForJob(ctx, bi.logger, job)
 	if err != nil {
 		return err
 	}
-	flight.markFinished()
+	activeJob.markFinished()
 	if err := status.Err(); err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "load data")
 	}

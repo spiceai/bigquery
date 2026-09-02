@@ -66,7 +66,8 @@ type statement struct {
 
 	cancelMu  sync.Mutex
 	execution *statementExecution
-	inFlight  map[*cancellableJob]struct{}
+	// Query and bulk-ingest paths wait for each job before submitting the next.
+	activeJob *jobCancellation
 }
 
 func (st *statement) GetOptionBytes(key string) ([]byte, error) {

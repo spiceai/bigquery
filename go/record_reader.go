@@ -64,19 +64,18 @@ func checkContext(ctx context.Context, maybeErr error) error {
 }
 
 func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, executeUpdate bool, st *statement) (bigquery.ArrowIterator, int64, error) {
-	flight := st.beginJob(st.cnxn.client, &query.JobIDConfig)
-	defer st.endJob(flight)
+	// Parameterized execution reuses query, including its job ID policy.
+	jobIDConfig := query.JobIDConfig
+	defer func() { query.JobIDConfig = jobIDConfig }()
 
-	watch := watchJobForCancellation(ctx, logger, flight, func() bool {
-		return !flight.finished.Load()
-	})
-	defer watch.stop()
+	activeJob := st.beginJob(st.cnxn.client, &query.JobIDConfig)
+	defer st.finishJob(ctx, logger, activeJob)
 
 	job, err := query.Run(ctx)
 	if err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "run query")
 	}
-	flight.setJob(job)
+	activeJob.setJob(job)
 
 	// XXX: Google SDK badness.  We can't use Wait here because queries that
 	// *fail* with a rateLimitExceeded (e.g. too many metadata operations)
@@ -92,7 +91,7 @@ func runQuery(ctx context.Context, logger *slog.Logger, query *bigquery.Query, e
 	if err != nil {
 		return nil, -1, err
 	}
-	flight.markFinished()
+	activeJob.markFinished()
 
 	if err := js.Err(); err != nil {
 		return nil, -1, errToAdbcErr(adbc.StatusInternal, err, "complete job")

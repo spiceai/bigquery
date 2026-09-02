@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"testing"
 )
@@ -28,7 +29,8 @@ func TestCancellableContextIsConcurrentSafe(t *testing.T) {
 		group.Add(2)
 		go func() {
 			defer group.Done()
-			_ = contexts.newContext()
+			ctx := contexts.newContext()
+			contexts.finishContext(ctx)
 		}()
 		go func() {
 			defer group.Done()
@@ -39,20 +41,39 @@ func TestCancellableContextIsConcurrentSafe(t *testing.T) {
 	contexts.cancelContext()
 }
 
-func TestStatementExecutionContextIsConcurrentSafe(t *testing.T) {
-	var statement cStmt
-	var group sync.WaitGroup
-	for range 100 {
-		group.Add(2)
-		go func() {
-			defer group.Done()
-			ctx := statement.beginExecutionContext()
-			statement.finishExecutionContext(ctx)
-		}()
-		go func() {
-			defer group.Done()
-			statement.cancelExecutionContext()
-		}()
+func TestCancellableContextFinishDoesNotClearNewContext(t *testing.T) {
+	var contexts cancellableContext
+	first := contexts.newContext()
+	second := contexts.newContext()
+	contexts.finishContext(first)
+
+	select {
+	case <-second.Done():
+		t.Fatal("finishing an old operation cancelled the current one")
+	default:
 	}
-	group.Wait()
+
+	if !contexts.cancelContext() {
+		t.Fatal("current operation was not active")
+	}
+	if second.Err() != context.Canceled {
+		t.Fatalf("current operation context error = %v, want context.Canceled", second.Err())
+	}
+}
+
+func TestStatementExecutionContextIsSeparate(t *testing.T) {
+	var statement cStmt
+	statement.newContext()
+	defer statement.cancelContext()
+	if statement.executionContext.cancelContext() {
+		t.Fatal("a non-execution operation was treated as an active execution")
+	}
+
+	ctx := statement.executionContext.newContext()
+	if !statement.executionContext.cancelContext() {
+		t.Fatal("current execution was not active")
+	}
+	if ctx.Err() != context.Canceled {
+		t.Fatalf("execution context error = %v, want context.Canceled", ctx.Err())
+	}
 }

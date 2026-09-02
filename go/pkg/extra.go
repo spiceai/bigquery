@@ -25,37 +25,8 @@ import "C"
 
 import "context"
 
-type statementCanceller interface {
+type statementCanceler interface {
 	Cancel(context.Context) error
-}
-
-func (st *cStmt) beginExecutionContext() context.Context {
-	st.executionMu.Lock()
-	defer st.executionMu.Unlock()
-	if st.executionCancel != nil {
-		st.executionCancel()
-	}
-	st.executionCtx, st.executionCancel = context.WithCancel(context.Background())
-	return st.executionCtx
-}
-
-func (st *cStmt) finishExecutionContext(ctx context.Context) {
-	st.executionMu.Lock()
-	defer st.executionMu.Unlock()
-	if st.executionCtx == ctx {
-		st.executionCtx = nil
-		st.executionCancel = nil
-	}
-}
-
-func (st *cStmt) cancelExecutionContext() bool {
-	st.executionMu.Lock()
-	defer st.executionMu.Unlock()
-	if st.executionCancel == nil {
-		return false
-	}
-	st.executionCancel()
-	return true
 }
 
 //export AdbcDriverBigQueryInit

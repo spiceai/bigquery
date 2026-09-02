@@ -34,69 +34,54 @@ import (
 
 const jobCancelTimeout = 30 * time.Second
 
-type jobCanceller interface {
-	ID() string
+type jobCanceler interface {
 	Cancel(context.Context) error
 }
 
-type jobResolver func(context.Context) (jobCanceller, error)
-
-// cancellableJob identifies a job before jobs.insert starts, so cancellation
+// jobCancellation identifies a job before jobs.insert starts, so cancellation
 // can still find it if BigQuery accepts the insert but its response is lost.
-type cancellableJob struct {
+type jobCancellation struct {
 	id      string
-	resolve jobResolver
+	resolve func(context.Context) (jobCanceler, error)
 
-	jobMu sync.RWMutex
-	job   jobCanceller
+	jobMu sync.Mutex
+	job   jobCanceler
 
 	finished atomic.Bool
 	once     sync.Once
-	done     chan struct{}
 	err      error
 }
 
-func newCancellableJob(id string, resolve jobResolver) *cancellableJob {
-	return &cancellableJob{id: id, resolve: resolve, done: make(chan struct{})}
+func newJobCancellation(id string, resolve func(context.Context) (jobCanceler, error)) *jobCancellation {
+	return &jobCancellation{id: id, resolve: resolve}
 }
 
-func (j *cancellableJob) ID() string { return j.id }
-
-func (j *cancellableJob) setJob(job jobCanceller) {
+func (j *jobCancellation) setJob(job jobCanceler) {
 	j.jobMu.Lock()
 	j.job = job
 	j.jobMu.Unlock()
 }
 
-func (j *cancellableJob) currentJob() jobCanceller {
-	j.jobMu.RLock()
-	defer j.jobMu.RUnlock()
+func (j *jobCancellation) currentJob() jobCanceler {
+	j.jobMu.Lock()
+	defer j.jobMu.Unlock()
 	return j.job
 }
 
-func (j *cancellableJob) markFinished() { j.finished.Store(true) }
+func (j *jobCancellation) markFinished() { j.finished.Store(true) }
 
-func (j *cancellableJob) cancel(ctx context.Context) error {
+func (j *jobCancellation) cancel(ctx context.Context) error {
 	if j.finished.Load() {
 		return nil
 	}
 
 	j.once.Do(func() {
-		go func() {
-			defer close(j.done)
-			j.err = j.cancelJob(ctx)
-		}()
+		j.err = j.cancelJob(ctx)
 	})
-
-	select {
-	case <-j.done:
-		return j.err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return j.err
 }
 
-func (j *cancellableJob) cancelJob(ctx context.Context) error {
+func (j *jobCancellation) cancelJob(ctx context.Context) error {
 	if j.finished.Load() {
 		return nil
 	}
@@ -134,8 +119,8 @@ func (j *cancellableJob) cancelJob(ctx context.Context) error {
 }
 
 func isJobNotFound(err error) bool {
-	var apiErr *googleapi.Error
-	return errors.As(err, &apiErr) && apiErr.Code == 404
+	apiErr, ok := errors.AsType[*googleapi.Error](err)
+	return ok && apiErr.Code == 404
 }
 
 type statementExecution struct {
@@ -165,7 +150,7 @@ func (st *statement) endExecution(op *statementExecution) {
 	st.cancelMu.Unlock()
 }
 
-func (st *statement) beginJob(client *bigquery.Client, config *bigquery.JobIDConfig) *cancellableJob {
+func (st *statement) beginJob(client *bigquery.Client, config *bigquery.JobIDConfig) *jobCancellation {
 	if config.JobID == "" {
 		config.JobID = uuid.NewString()
 	} else if config.AddJobIDSuffix {
@@ -181,25 +166,38 @@ func (st *statement) beginJob(client *bigquery.Client, config *bigquery.JobIDCon
 		location = client.Location
 	}
 
-	flight := newCancellableJob(config.JobID, func(ctx context.Context) (jobCanceller, error) {
-		return client.JobFromProject(ctx, projectID, config.JobID, location)
+	jobID := config.JobID
+	job := newJobCancellation(jobID, func(ctx context.Context) (jobCanceler, error) {
+		return client.JobFromProject(ctx, projectID, jobID, location)
 	})
 	st.cancelMu.Lock()
-	if st.inFlight == nil {
-		st.inFlight = make(map[*cancellableJob]struct{})
-	}
-	st.inFlight[flight] = struct{}{}
+	st.activeJob = job
 	st.cancelMu.Unlock()
-	return flight
+	return job
 }
 
-func (st *statement) endJob(flight *cancellableJob) {
+// finishJob clears the active job and asynchronously cancels it if execution
+// returned before observing a terminal status.
+func (st *statement) finishJob(ctx context.Context, logger *slog.Logger, job *jobCancellation) {
 	st.cancelMu.Lock()
-	delete(st.inFlight, flight)
-	if len(st.inFlight) == 0 {
-		st.inFlight = nil
+	if st.activeJob == job {
+		st.activeJob = nil
 	}
 	st.cancelMu.Unlock()
+
+	if job.finished.Load() {
+		return
+	}
+
+	go func() {
+		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
+		defer cancel()
+		if err := job.cancel(cancelCtx); err != nil {
+			logger.WarnContext(cancelCtx, "failed to cancel job, so it may keep running and billing until it finishes", "id", job.id, "error", err)
+			return
+		}
+		logger.DebugContext(cancelCtx, "cancelled job", "id", job.id)
+	}()
 }
 
 // Cancel stops the current statement execution and waits for BigQuery to
@@ -207,91 +205,28 @@ func (st *statement) endJob(flight *cancellableJob) {
 func (st *statement) Cancel(ctx context.Context) error {
 	st.cancelMu.Lock()
 	op := st.execution
-	flights := make([]*cancellableJob, 0, len(st.inFlight))
-	for flight := range st.inFlight {
-		flights = append(flights, flight)
-	}
+	job := st.activeJob
 	st.cancelMu.Unlock()
 
-	if op == nil && len(flights) == 0 {
+	if op == nil && job == nil {
 		return adbc.Error{Code: adbc.StatusInvalidState, Msg: "[bq] no active query to cancel"}
 	}
 	if op != nil {
 		op.cancel()
 	}
-	if len(flights) == 0 {
+	if job == nil {
 		return nil
 	}
 
 	cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
 	defer cancel()
-	var group sync.WaitGroup
-	errs := make(chan error, len(flights))
-	for _, flight := range flights {
-		group.Go(func() {
-			if err := flight.cancel(cancelCtx); err != nil {
-				errs <- fmt.Errorf("job %s: %w", flight.ID(), err)
-			}
-		})
-	}
-	group.Wait()
-	close(errs)
-	var cancelErrors []error
-	for err := range errs {
-		cancelErrors = append(cancelErrors, err)
-	}
-	if err := errors.Join(cancelErrors...); err != nil {
+	if err := job.cancel(cancelCtx); err != nil {
 		return adbc.Error{
 			Code: adbc.StatusUnknown,
-			Msg:  fmt.Sprintf("[bq] failed to cancel BigQuery jobs: %s", err),
+			Msg:  fmt.Sprintf("[bq] failed to cancel BigQuery job %s: %s", job.id, err),
 		}
 	}
 	return nil
-}
-
-type jobCancelWatch struct {
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	finished chan struct{}
-}
-
-func (w *jobCancelWatch) stop() { w.stopOnce.Do(func() { close(w.stopCh) }) }
-
-func (w *jobCancelWatch) wait() { <-w.finished }
-
-// watchJobForCancellation cancels work that outlives its caller. Whether the
-// job reached a terminal state, rather than which channel wakes the watcher,
-// decides whether jobs.cancel is needed.
-func watchJobForCancellation(
-	ctx context.Context,
-	logger *slog.Logger,
-	job *cancellableJob,
-	abandoned func() bool,
-) *jobCancelWatch {
-	watch := &jobCancelWatch{stopCh: make(chan struct{}), finished: make(chan struct{})}
-	go func() {
-		defer close(watch.finished)
-		// The execution path closes stopCh after publishing whether it saw a
-		// terminal status. Waiting for that handoff avoids cancelling a job
-		// that completed just as the query context was cancelled.
-		<-watch.stopCh
-		if !abandoned() {
-			return
-		}
-
-		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobCancelTimeout)
-		defer cancel()
-		if err := job.cancel(cancelCtx); err != nil {
-			if logger != nil {
-				logger.WarnContext(cancelCtx, "failed to cancel job, so it may keep running and billing until it finishes", "id", job.ID(), "error", err)
-			}
-			return
-		}
-		if logger != nil {
-			logger.DebugContext(cancelCtx, "cancelled job", "id", job.ID())
-		}
-	}()
-	return watch
 }
 
 // executionBoundReader keeps a statement cancellable while its result stream
@@ -310,11 +245,7 @@ func bindExecutionReader(inner array.RecordReader, finish func()) array.RecordRe
 }
 
 func (r *executionBoundReader) finishOnce() {
-	r.done.Do(func() {
-		if r.finish != nil {
-			r.finish()
-		}
-	})
+	r.done.Do(r.finish)
 }
 
 func (r *executionBoundReader) Retain() {
