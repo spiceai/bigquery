@@ -53,17 +53,17 @@ type databaseImpl struct {
 	// projectID is the catalog
 	projectID string
 	// datasetID is the schema
-	datasetID    string
-	tableID      string
-	location     string
-	quotaProject string
-	endpoint     string
+	datasetID       string
+	location        string
+	quotaProject    string
+	endpoint        string
+	storageEndpoint string
 
 	bulkIngestMethod      string
 	bulkIngestCompression string
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
+func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
 	conn := &connectionImpl{
 		ConnectionImplBase:         driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 		authType:                   d.authType,
@@ -76,11 +76,11 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		impersonateDelegates:       d.impersonateDelegates,
 		impersonateScopes:          d.impersonateScopes,
 		impersonateLifetime:        d.impersonateLifetime,
-		tableID:                    d.tableID,
 		catalog:                    d.projectID,
 		dbSchema:                   d.datasetID,
 		location:                   d.location,
 		endpoint:                   d.endpoint,
+		storageEndpoint:            d.storageEndpoint,
 		resultRecordBufferSize:     defaultQueryResultBufferSize,
 		prefetchConcurrency:        defaultQueryPrefetchConcurrency,
 		quotaProject:               d.quotaProject,
@@ -101,35 +101,36 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		Connection(), nil
 }
 
-func (d *databaseImpl) Close() error { return nil }
+func (d *databaseImpl) Close(ctx context.Context) error { return nil }
 
-func (d *databaseImpl) GetOption(key string) (string, error) {
+func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error) {
+	key = remapOption(key)
 	switch key {
-	case OptionStringAuthType:
+	case OptionAuthType:
 		return d.authType, nil
 	case OptionAuthCredentialsType:
 		return string(d.credentialsType), nil
-	case OptionStringAuthCredentials:
+	case OptionAuthCredentials:
 		return d.credentials, nil
-	case OptionStringAuthClientID:
+	case OptionAuthClientID:
 		return d.clientID, nil
-	case OptionStringAuthClientSecret:
+	case OptionAuthClientSecret:
 		return d.clientSecret, nil
-	case OptionStringAuthRefreshToken:
+	case OptionAuthRefreshToken:
 		return d.refreshToken, nil
-	case OptionStringAuthQuotaProject:
+	case OptionAuthQuotaProject:
 		return d.quotaProject, nil
-	case OptionStringLocation:
+	case OptionLocation:
 		return d.location, nil
-	case OptionStringProjectID:
+	case OptionProjectID:
 		return d.projectID, nil
-	case OptionStringDatasetID:
+	case OptionDatasetID:
 		return d.datasetID, nil
-	case OptionStringTableID:
-		return d.tableID, nil
-	case OptionStringEndpoint:
+	case OptionEndpoint:
 		return d.endpoint, nil
-	case OptionStringImpersonateLifetime:
+	case OptionStorageEndpoint:
+		return d.storageEndpoint, nil
+	case OptionImpersonateLifetime:
 		if d.impersonateLifetime == 0 {
 			// If no lifetime is set but impersonation is enabled, return the default
 			if d.hasImpersonationOptions() {
@@ -138,27 +139,27 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 			return "", nil
 		}
 		return d.impersonateLifetime.String(), nil
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		if d.bulkIngestMethod == "" {
 			return OptionValueBulkIngestMethodLoad, nil
 		}
 		return d.bulkIngestMethod, nil
-	case OptionStringBulkIngestCompression:
+	case OptionBulkIngestCompression:
 		if d.bulkIngestCompression == "" {
 			return OptionValueCompressionNone, nil
 		}
 		return d.bulkIngestCompression, nil
 	default:
-		return d.DatabaseImplBase.GetOption(key)
+		return d.DatabaseImplBase.GetOption(ctx, key)
 	}
 }
 
-func (d *databaseImpl) SetOptions(options map[string]string) error {
+func (d *databaseImpl) SetOptions(ctx context.Context, options map[string]string) error {
 	// Process "uri" first so that URI-parsed defaults (e.g. auth_type=ADC) are
 	// set before any explicit options. Subsequent options will then override
 	// those defaults, regardless of Go's non-deterministic map iteration order.
 	if uri, ok := options["uri"]; ok {
-		if err := d.SetOption("uri", uri); err != nil {
+		if err := d.SetOption(ctx, "uri", uri); err != nil {
 			return err
 		}
 	}
@@ -166,7 +167,7 @@ func (d *databaseImpl) SetOptions(options map[string]string) error {
 		if k == "uri" {
 			continue // already processed above
 		}
-		err := d.SetOption(k, v)
+		err := d.SetOption(ctx, k, v)
 		if err != nil {
 			return err
 		}
@@ -180,7 +181,8 @@ func (d *databaseImpl) hasImpersonationOptions() bool {
 		len(d.impersonateScopes) > 0
 }
 
-func (d *databaseImpl) SetOption(key string, value string) error {
+func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) error {
+	key = remapOption(key)
 	switch key {
 	case "uri":
 		params, err := ParseBigQueryURIToParams(value)
@@ -189,18 +191,20 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 		}
 
 		for paramKey, paramValue := range params {
-			if err := d.SetOption(paramKey, paramValue); err != nil {
+			if err := d.SetOption(ctx, paramKey, paramValue); err != nil {
 				return err
 			}
 		}
 		return nil
-	case OptionStringAuthType:
+	case OptionAuthType:
+		value = remapOption(value)
 		switch value {
 		case OptionValueAuthTypeDefault,
 			OptionValueAuthTypeJSONCredentialFile,
 			OptionValueAuthTypeJSONCredentialString,
 			OptionValueAuthTypeUserAuthentication,
-			OptionValueAuthTypeAppDefaultCredentials:
+			OptionValueAuthTypeAppDefaultCredentials,
+			OptionValueAuthTypeAnonymous:
 			d.authType = value
 		default:
 			return adbc.Error{
@@ -209,6 +213,7 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 			}
 		}
 	case OptionAuthCredentialsType:
+		value = remapOption(value)
 		// N.B. ExternalAccountAuthorizedUser, GDCHServiceAccount aren't re-exported by google.golang.org/api/option
 		switch value {
 		case string(option.ServiceAccount):
@@ -225,23 +230,23 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 				Msg:  fmt.Sprintf("[bq] unknown %s=%s", key, value),
 			}
 		}
-	case OptionStringAuthCredentials:
+	case OptionAuthCredentials:
 		d.credentials = value
-	case OptionStringAuthClientID:
+	case OptionAuthClientID:
 		d.clientID = value
-	case OptionStringAuthClientSecret:
+	case OptionAuthClientSecret:
 		d.clientSecret = value
-	case OptionStringAuthRefreshToken:
+	case OptionAuthRefreshToken:
 		d.refreshToken = value
-	case OptionStringAuthQuotaProject:
+	case OptionAuthQuotaProject:
 		d.quotaProject = value
-	case OptionStringImpersonateTargetPrincipal:
+	case OptionImpersonateTargetPrincipal:
 		d.impersonateTargetPrincipal = value
-	case OptionStringImpersonateDelegates:
+	case OptionImpersonateDelegates:
 		d.impersonateDelegates = strings.Split(value, ",")
-	case OptionStringImpersonateScopes:
+	case OptionImpersonateScopes:
 		d.impersonateScopes = strings.Split(value, ",")
-	case OptionStringImpersonateLifetime:
+	case OptionImpersonateLifetime:
 		duration, err := time.ParseDuration(value)
 		if err != nil {
 			return adbc.Error{
@@ -250,17 +255,17 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 			}
 		}
 		d.impersonateLifetime = duration
-	case OptionStringProjectID:
+	case OptionProjectID:
 		d.projectID = value
-	case OptionStringDatasetID:
+	case OptionDatasetID:
 		d.datasetID = value
-	case OptionStringTableID:
-		d.tableID = value
-	case OptionStringEndpoint:
+	case OptionEndpoint:
 		d.endpoint = value
-	case OptionStringLocation:
+	case OptionStorageEndpoint:
+		d.storageEndpoint = value
+	case OptionLocation:
 		d.location = value
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		if value != OptionValueBulkIngestMethodLoad &&
 			value != OptionValueBulkIngestMethodStorageWrite {
 			return adbc.Error{
@@ -269,7 +274,7 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 			}
 		}
 		d.bulkIngestMethod = value
-	case OptionStringBulkIngestCompression:
+	case OptionBulkIngestCompression:
 		if value != OptionValueCompressionNone &&
 			value != OptionValueCompressionLZ4 &&
 			value != OptionValueCompressionZSTD {
@@ -280,7 +285,7 @@ func (d *databaseImpl) SetOption(key string, value string) error {
 		}
 		d.bulkIngestCompression = value
 	default:
-		return d.DatabaseImplBase.SetOption(key, value)
+		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}
 	return nil
 }
@@ -318,7 +323,7 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 	}
 
 	params := make(map[string]string)
-	params[OptionStringProjectID] = projectID
+	params[OptionProjectID] = projectID
 
 	// Handle host and port
 	var endpoint string
@@ -338,7 +343,7 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 	}
 
 	// Store endpoint as hostname:port (Google client library handles https:// internally)
-	params[OptionStringEndpoint] = endpoint
+	params[OptionEndpoint] = endpoint
 
 	queryParams := parsedURI.Query()
 
@@ -354,9 +359,9 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 
 		switch oauthType {
 		case 0:
-			params[OptionStringAuthType] = OptionValueAuthTypeAppDefaultCredentials
+			params[OptionAuthType] = OptionValueAuthTypeAppDefaultCredentials
 		case 1:
-			params[OptionStringAuthType] = OptionValueAuthTypeJSONCredentialFile
+			params[OptionAuthType] = OptionValueAuthTypeJSONCredentialFile
 
 			authCredentials := queryParams.Get("AuthCredentials")
 			if authCredentials == "" {
@@ -373,10 +378,10 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 					Msg:  fmt.Sprintf("[bq] invalid AuthCredentials format: %v", err),
 				}
 			}
-			params[OptionStringAuthCredentials] = decodedCreds
+			params[OptionAuthCredentials] = decodedCreds
 			queryParams.Del("AuthCredentials")
 		case 2:
-			params[OptionStringAuthType] = OptionValueAuthTypeJSONCredentialString
+			params[OptionAuthType] = OptionValueAuthTypeJSONCredentialString
 
 			authCredentials := queryParams.Get("AuthCredentials")
 			if authCredentials == "" {
@@ -393,10 +398,10 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 					Msg:  fmt.Sprintf("[bq] invalid AuthCredentials format: %v", err),
 				}
 			}
-			params[OptionStringAuthCredentials] = decodedCreds
+			params[OptionAuthCredentials] = decodedCreds
 			queryParams.Del("AuthCredentials")
 		case 3:
-			params[OptionStringAuthType] = OptionValueAuthTypeUserAuthentication
+			params[OptionAuthType] = OptionValueAuthTypeUserAuthentication
 
 			clientID := queryParams.Get("AuthClientId")
 			clientSecret := queryParams.Get("AuthClientSecret")
@@ -407,9 +412,9 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 					Msg:  "[bq] AuthClientId, AuthClientSecret and AuthRefreshToken required for OAuth authentication",
 				}
 			}
-			params[OptionStringAuthClientID] = clientID
-			params[OptionStringAuthClientSecret] = clientSecret
-			params[OptionStringAuthRefreshToken] = refreshToken
+			params[OptionAuthClientID] = clientID
+			params[OptionAuthClientSecret] = clientSecret
+			params[OptionAuthRefreshToken] = refreshToken
 			queryParams.Del("AuthClientId")
 			queryParams.Del("AuthClientSecret")
 			queryParams.Del("AuthRefreshToken")
@@ -422,25 +427,24 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 		queryParams.Del("OAuthType")
 	} else {
 		// if not provided default to ADC
-		params[OptionStringAuthType] = OptionValueAuthTypeAppDefaultCredentials
+		params[OptionAuthType] = OptionValueAuthTypeAppDefaultCredentials
 	}
 
 	parameterMap := map[string]string{
-		"DatasetId":    OptionStringDatasetID,
-		"Location":     OptionStringLocation,
-		"TableId":      OptionStringTableID,
-		"QuotaProject": OptionStringAuthQuotaProject,
+		"DatasetId":    OptionDatasetID,
+		"Location":     OptionLocation,
+		"QuotaProject": OptionAuthQuotaProject,
 
 		// Auth parameters - processed in OAuthType switch above, here for consistency
-		"AuthCredentials":  OptionStringAuthCredentials,
-		"AuthClientId":     OptionStringAuthClientID,
-		"AuthClientSecret": OptionStringAuthClientSecret,
-		"AuthRefreshToken": OptionStringAuthRefreshToken,
+		"AuthCredentials":  OptionAuthCredentials,
+		"AuthClientId":     OptionAuthClientID,
+		"AuthClientSecret": OptionAuthClientSecret,
+		"AuthRefreshToken": OptionAuthRefreshToken,
 
-		"ImpersonateTargetPrincipal": OptionStringImpersonateTargetPrincipal,
-		"ImpersonateDelegates":       OptionStringImpersonateDelegates,
-		"ImpersonateScopes":          OptionStringImpersonateScopes,
-		"ImpersonateLifetime":        OptionStringImpersonateLifetime,
+		"ImpersonateTargetPrincipal": OptionImpersonateTargetPrincipal,
+		"ImpersonateDelegates":       OptionImpersonateDelegates,
+		"ImpersonateScopes":          OptionImpersonateScopes,
+		"ImpersonateLifetime":        OptionImpersonateLifetime,
 	}
 
 	// Process all query parameters to convert URI params to option constants

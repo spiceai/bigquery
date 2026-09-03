@@ -55,6 +55,14 @@ func safeWaitForJob(ctx context.Context, logger *slog.Logger, job *bigquery.Job)
 		Multiplier: 1.3,
 		Max:        60 * time.Second,
 	}
+
+	// dry-run jobs already have a status. as an optimization, poll LastStatus (which is a simple getter)
+	js = job.LastStatus()
+	if js.Err() != nil || js.Done() {
+		logger.DebugContext(ctx, "job complete", "id", job.ID())
+		return js, nil
+	}
+
 	for {
 		js, err = func() (*bigquery.JobStatus, error) {
 			ctxWithDeadline, cancel := context.WithTimeout(ctx, time.Minute*5)
@@ -143,7 +151,7 @@ func isRetryableError(err error) bool {
 // errToAdbcErr converts an error to an ADBC error, using the metadata from
 // Google API errors if possible and including the supplied context
 func errToAdbcErr(defaultStatus adbc.Status, err error, errContext string, contextArgs ...any) error {
-	if errors.Is(err, adbc.Error{}) {
+	if _, ok := errors.AsType[adbc.Error](err); ok {
 		return err
 	} else if errors.Is(err, context.Canceled) {
 		return adbc.Error{

@@ -35,9 +35,10 @@ import (
 
 	"cloud.google.com/go/bigquery"
 	driver "github.com/adbc-drivers/bigquery/go"
+	"github.com/adbc-drivers/driverbase-go/driverbase"
 	"github.com/adbc-drivers/driverbase-go/testutil"
+	"github.com/adbc-drivers/driverbase-go/validation"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/validation"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/decimal128"
@@ -98,19 +99,19 @@ func (q *BigQueryQuirks) CreateSampleTable(tableName string, r arrow.RecordBatch
 	return errors.Join(err, status.Err())
 }
 
-func (q *BigQueryQuirks) SetupDriver(t *testing.T) adbc.Driver {
+func (q *BigQueryQuirks) SetupDriver(t *testing.T) driverbase.DriverWithContext {
 	q.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	return driver.NewDriver(q.mem)
 }
 
-func (q *BigQueryQuirks) TearDownDriver(t *testing.T, _ adbc.Driver) {
+func (q *BigQueryQuirks) TearDownDriver(t *testing.T, _ driverbase.DriverWithContext) {
 	q.mem.AssertSize(t, 0)
 }
 
 func (q *BigQueryQuirks) DatabaseOptions() map[string]string {
 	return map[string]string{
-		driver.OptionStringProjectID: q.catalogName,
-		driver.OptionStringDatasetID: q.schemaName,
+		driver.OptionProjectID: q.catalogName,
+		driver.OptionDatasetID: q.schemaName,
 	}
 }
 
@@ -119,7 +120,7 @@ func getSqlTypeFromArrowField(f arrow.Field) string {
 	case arrow.BOOL:
 		return "BOOLEAN"
 	case arrow.UINT8, arrow.INT8, arrow.UINT16, arrow.INT16, arrow.UINT32, arrow.INT32, arrow.UINT64, arrow.INT64:
-		return "INTEGER"
+		return "INT64"
 	case arrow.FLOAT32, arrow.FLOAT64:
 		return "FLOAT64"
 	case arrow.STRING:
@@ -160,7 +161,7 @@ func (q *BigQueryQuirks) quoteTblName(name string) string {
 	return fmt.Sprintf("`%s.%s`", q.schemaName, strings.ReplaceAll(name, "\"", "\"\""))
 }
 
-func (q *BigQueryQuirks) CreateSampleTableWithRecords(tableName string, r arrow.RecordBatch) error {
+func (q *BigQueryQuirks) CreateSampleTableWithRecords(tableName string, r arrow.RecordBatch) (err error) {
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE TABLE ")
 	b.WriteString(q.quoteTblName(tableName))
@@ -180,63 +181,43 @@ func (q *BigQueryQuirks) CreateSampleTableWithRecords(tableName string, r arrow.
 	ctx := context.Background()
 	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	tmpDriver := driver.NewDriver(mem)
-	db, err := tmpDriver.NewDatabase(q.DatabaseOptions())
-	if err != nil {
-		panic(err)
+	db, dbErr := tmpDriver.NewDatabaseWithContext(ctx, q.DatabaseOptions())
+	if dbErr != nil {
+		return dbErr
 	}
-	defer func() {
-		err := db.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, db.Close(ctx)) }()
 
-	cnxn, err := db.Open(ctx)
-	if err != nil {
-		panic(err)
+	cnxn, cnxnErr := db.Open(ctx)
+	if cnxnErr != nil {
+		return cnxnErr
 	}
-	defer func() {
-		err := cnxn.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, cnxn.Close(ctx)) }()
 
-	stmt, err := cnxn.NewStatement()
-	if err != nil {
-		panic(err)
+	stmt, stmtErr := cnxn.NewStatement(ctx)
+	if stmtErr != nil {
+		return stmtErr
 	}
-	defer func() {
-		err := stmt.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, stmt.Close(ctx)) }()
 
-	err = stmt.SetOption(driver.OptionBoolQueryUseLegacySQL, "false")
-	if err != nil {
-		panic(err)
+	if err = stmt.SetOption(ctx, driver.OptionQueryUseLegacySQL, "false"); err != nil {
+		return err
 	}
 
 	creationQuery := b.String()
-	err = stmt.SetSqlQuery(creationQuery)
-	if err != nil {
-		panic(err)
+	if err = stmt.SetSqlQuery(ctx, creationQuery); err != nil {
+		return err
 	}
-	_, err = stmt.ExecuteUpdate(ctx)
-	if err != nil {
-		panic(err)
+	if _, err = stmt.ExecuteUpdate(ctx); err != nil {
+		return err
 	}
 
 	insertQuery := "INSERT INTO " + q.quoteTblName(tableName) + " VALUES ("
 	bindings := strings.Repeat("?,", int(r.NumCols()))
 	insertQuery += bindings[:len(bindings)-1] + ")"
-	err = stmt.Bind(ctx, r)
-	if err != nil {
+	if err = stmt.Bind(ctx, r); err != nil {
 		return err
 	}
-	err = stmt.SetSqlQuery(insertQuery)
-	if err != nil {
+	if err = stmt.SetSqlQuery(ctx, insertQuery); err != nil {
 		return err
 	}
 	rdr, _, err := stmt.ExecuteQuery(ctx)
@@ -248,7 +229,7 @@ func (q *BigQueryQuirks) CreateSampleTableWithRecords(tableName string, r arrow.
 	return nil
 }
 
-func (q *BigQueryQuirks) CreateSampleTableWithStreams(tableName string, rdr array.RecordReader) error {
+func (q *BigQueryQuirks) CreateSampleTableWithStreams(tableName string, rdr array.RecordReader) (err error) {
 	var b strings.Builder
 	b.WriteString("CREATE OR REPLACE TABLE ")
 	b.WriteString(q.quoteTblName(tableName))
@@ -268,63 +249,43 @@ func (q *BigQueryQuirks) CreateSampleTableWithStreams(tableName string, rdr arra
 	ctx := context.Background()
 	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 	tmpDriver := driver.NewDriver(mem)
-	db, err := tmpDriver.NewDatabase(q.DatabaseOptions())
-	if err != nil {
-		panic(err)
+	db, dbErr := tmpDriver.NewDatabaseWithContext(ctx, q.DatabaseOptions())
+	if dbErr != nil {
+		return dbErr
 	}
-	defer func() {
-		err := db.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, db.Close(ctx)) }()
 
-	cnxn, err := db.Open(ctx)
-	if err != nil {
-		panic(err)
+	cnxn, cnxnErr := db.Open(ctx)
+	if cnxnErr != nil {
+		return cnxnErr
 	}
-	defer func() {
-		err := cnxn.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, cnxn.Close(ctx)) }()
 
-	stmt, err := cnxn.NewStatement()
-	if err != nil {
-		panic(err)
+	stmt, stmtErr := cnxn.NewStatement(ctx)
+	if stmtErr != nil {
+		return stmtErr
 	}
-	defer func() {
-		err := stmt.Close()
-		if err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, stmt.Close(ctx)) }()
 
-	err = stmt.SetOption(driver.OptionBoolQueryUseLegacySQL, "false")
-	if err != nil {
-		panic(err)
+	if err = stmt.SetOption(ctx, driver.OptionQueryUseLegacySQL, "false"); err != nil {
+		return err
 	}
 
 	creationQuery := b.String()
-	err = stmt.SetSqlQuery(creationQuery)
-	if err != nil {
-		panic(err)
+	if err = stmt.SetSqlQuery(ctx, creationQuery); err != nil {
+		return err
 	}
-	_, err = stmt.ExecuteUpdate(ctx)
-	if err != nil {
-		panic(err)
+	if _, err = stmt.ExecuteUpdate(ctx); err != nil {
+		return err
 	}
 
 	insertQuery := "INSERT INTO " + q.quoteTblName(tableName) + " VALUES ("
 	bindings := strings.Repeat("?,", rdr.Schema().NumFields())
 	insertQuery += bindings[:len(bindings)-1] + ")"
-	err = stmt.BindStream(ctx, rdr)
-	if err != nil {
+	if err = stmt.BindStream(ctx, rdr); err != nil {
 		return err
 	}
-	err = stmt.SetSqlQuery(insertQuery)
-	if err != nil {
+	if err = stmt.SetSqlQuery(ctx, insertQuery); err != nil {
 		return err
 	}
 	res, _, err := stmt.ExecuteQuery(ctx)
@@ -336,22 +297,19 @@ func (q *BigQueryQuirks) CreateSampleTableWithStreams(tableName string, rdr arra
 	return nil
 }
 
-func (q *BigQueryQuirks) DropTable(cnxn adbc.Connection, tblname string) error {
-	stmt, err := cnxn.NewStatement()
-	if err != nil {
-		return err
+func (q *BigQueryQuirks) DropTable(cnxn adbc.ConnectionWithContext, tblname string) (err error) {
+	ctx := context.Background()
+	stmt, stmtErr := cnxn.NewStatement(ctx)
+	if stmtErr != nil {
+		return stmtErr
 	}
-	defer func() {
-		if err = stmt.Close(); err != nil {
-			panic(err)
-		}
-	}()
+	defer func() { err = errors.Join(err, stmt.Close(ctx)) }()
 
-	if err = stmt.SetSqlQuery(`DROP TABLE IF EXISTS ` + q.quoteTblName(tblname)); err != nil {
+	if err = stmt.SetSqlQuery(ctx, `DROP TABLE IF EXISTS `+q.quoteTblName(tblname)); err != nil {
 		return err
 	}
 
-	_, err = stmt.ExecuteUpdate(context.Background())
+	_, err = stmt.ExecuteUpdate(ctx)
 	return err
 }
 
@@ -362,6 +320,7 @@ func (q *BigQueryQuirks) SupportsConcurrentStatements() bool          { return f
 func (q *BigQueryQuirks) SupportsCurrentCatalogSchema() bool          { return true }
 func (q *BigQueryQuirks) SupportsExecuteSchema() bool                 { return false }
 func (q *BigQueryQuirks) SupportsGetSetOptions() bool                 { return true }
+func (q *BigQueryQuirks) SupportsGetTableSchema() bool                { return true }
 func (q *BigQueryQuirks) SupportsPartitionedData() bool               { return false }
 func (q *BigQueryQuirks) SupportsStatistics() bool                    { return true }
 func (q *BigQueryQuirks) SupportsTransactions() bool                  { return false }
@@ -379,9 +338,9 @@ func (q *BigQueryQuirks) GetMetadata(code adbc.InfoCode) any {
 	case adbc.InfoDriverVersion:
 		return "(unknown or development build)"
 	case adbc.InfoDriverArrowVersion:
-		return "(unknown or development build)"
+		return "v18.7.0"
 	case adbc.InfoVendorVersion:
-		return ""
+		return "cloud.google.com/go/bigquery v1.80.0"
 	case adbc.InfoVendorArrowVersion:
 		return "(unknown or development build)"
 	case adbc.InfoDriverADBCVersion:
@@ -415,21 +374,22 @@ func (q *BigQueryQuirks) SampleTableSchemaMetadata(tblName string, dt arrow.Data
 	return arrow.MetadataFrom(metadata)
 }
 
-func createTempSchema(ctx context.Context, client *bigquery.Client) string {
+func createTempSchema(t *testing.T, ctx context.Context, client *bigquery.Client) string {
+	t.Helper()
 	schemaName := strings.ToUpper("ADBC_TESTING_" + strings.ReplaceAll(uuid.New().String(), "-", "_"))
 	dataset := client.Dataset(schemaName)
-	err := dataset.Create(ctx, nil)
-	if err != nil {
-		panic(err)
+	if err := dataset.Create(ctx, nil); err != nil {
+		t.Fatalf("failed to create temp schema %s: %v", schemaName, err)
 	}
 
 	fmt.Printf("Created temp schema %s\n", schemaName)
 	return schemaName
 }
 
-func dropTempSchema(ctx context.Context, client *bigquery.Client, schemaName string) {
+func dropTempSchema(t *testing.T, ctx context.Context, client *bigquery.Client, schemaName string) {
+	t.Helper()
 	if err := client.Dataset(schemaName).DeleteWithContents(ctx); err != nil {
-		panic(err)
+		t.Fatalf("failed to drop temp schema %s: %v", schemaName, err)
 	}
 	fmt.Printf("Dropped temp schema %s\n", schemaName)
 }
@@ -519,7 +479,8 @@ func buildSamplePrimitiveTypeRecord(mem memory.Allocator, schema, bigquery *arro
 	bytesData := [][]byte{[]byte("first"), []byte("second"), []byte("third")}
 	booleans := []bool{true, false, true}
 	date32s := []arrow.Date32{1, 2, 3}
-	arrowTime64s := []arrow.Time64{1, 2, 3}
+	arrowTime64ns := []arrow.Time64{1000, 2000, 3000}
+	arrowTime64us := []arrow.Time64{1, 2, 3}
 	arrowTime32s := []arrow.Time32{1, 2, 3}
 	arrowTimestampNs := []arrow.Timestamp{1000000000, 2000000000, 3000000000}
 	arrowTimestampUs := []arrow.Timestamp{1000000, 2000000, 3000000}
@@ -531,8 +492,8 @@ func buildSamplePrimitiveTypeRecord(mem memory.Allocator, schema, bigquery *arro
 	bldr.Field(3).(*array.BinaryBuilder).AppendValues(bytesData, nil)
 	bldr.Field(4).(*array.BooleanBuilder).AppendValues(booleans, nil)
 	bldr.Field(5).(*array.Date32Builder).AppendValues(date32s, nil)
-	bldr.Field(6).(*array.Time64Builder).AppendValues(arrowTime64s, nil)
-	bldr.Field(7).(*array.Time64Builder).AppendValues(arrowTime64s, nil)
+	bldr.Field(6).(*array.Time64Builder).AppendValues(arrowTime64ns, nil)
+	bldr.Field(7).(*array.Time64Builder).AppendValues(arrowTime64us, nil)
 	bldr.Field(8).(*array.Time32Builder).AppendValues(arrowTime32s, nil)
 	bldr.Field(9).(*array.Time32Builder).AppendValues(arrowTime32s, nil)
 	bldr.Field(10).(*array.TimestampBuilder).AppendValues(arrowTimestampNs, nil)
@@ -548,8 +509,9 @@ func buildSamplePrimitiveTypeRecord(mem memory.Allocator, schema, bigquery *arro
 	bldr2.Field(3).(*array.BinaryBuilder).AppendValues(bytesData, nil)
 	bldr2.Field(4).(*array.BooleanBuilder).AppendValues(booleans, nil)
 	bldr2.Field(5).(*array.Date32Builder).AppendValues(date32s, nil)
-	bldr2.Field(6).(*array.Time64Builder).AppendValues(arrowTime64s, nil)
-	bldr2.Field(7).(*array.Time64Builder).AppendValues(arrowTime64s, nil)
+	// BigQuery only supports microseconds, so nanoseconds come out as microseconds
+	bldr2.Field(6).(*array.Time64Builder).AppendValues(arrowTime64us, nil)
+	bldr2.Field(7).(*array.Time64Builder).AppendValues(arrowTime64us, nil)
 	bldr2.Field(8).(*array.Time64Builder).AppendValues(bigQueryTime32msAsTime64us, nil)
 	bldr2.Field(9).(*array.Time64Builder).AppendValues(bigQueryTime32sAsTime64us, nil)
 	bldr2.Field(10).(*array.TimestampBuilder).AppendValues(bigQueryTimestamps, nil)
@@ -576,11 +538,11 @@ func withQuirks(t *testing.T, fn func(quirks *BigQueryQuirks)) {
 		ctx:         ctx,
 		client:      client,
 		catalogName: client.Project(),
-		schemaName:  createTempSchema(ctx, client),
+		schemaName:  createTempSchema(t, ctx, client),
 	}
 
 	t.Cleanup(func() {
-		dropTempSchema(ctx, client, q.schemaName)
+		dropTempSchema(t, ctx, client, q.schemaName)
 	})
 
 	fn(q)
@@ -623,30 +585,36 @@ type BigQueryTests struct {
 	Quirks *BigQueryQuirks
 
 	ctx    context.Context
-	driver adbc.Driver
-	db     adbc.Database
-	cnxn   adbc.Connection
-	stmt   adbc.Statement
+	driver driverbase.DriverWithContext
+	db     adbc.DatabaseWithContext
+	cnxn   adbc.ConnectionWithContext
+	stmt   adbc.StatementWithContext
 }
 
 func (suite *BigQueryTests) SetupTest() {
 	var err error
 	suite.ctx = context.Background()
 	suite.driver = suite.Quirks.SetupDriver(suite.T())
-	suite.db, err = suite.driver.NewDatabase(suite.Quirks.DatabaseOptions())
+	suite.db, err = suite.driver.NewDatabaseWithContext(suite.ctx, suite.Quirks.DatabaseOptions())
 	suite.NoError(err)
 	suite.cnxn, err = suite.db.Open(suite.ctx)
 	suite.NoError(err)
-	suite.stmt, err = suite.cnxn.NewStatement()
+	suite.stmt, err = suite.cnxn.NewStatement(suite.ctx)
 	suite.NoError(err)
 }
 
 func (suite *BigQueryTests) TearDownTest() {
-	suite.NoError(suite.stmt.Close())
-	suite.NoError(suite.cnxn.Close())
+	if suite.stmt != nil {
+		suite.NoError(suite.stmt.Close(suite.ctx))
+	}
+	if suite.cnxn != nil {
+		suite.NoError(suite.cnxn.Close(suite.ctx))
+	}
 	suite.Quirks.TearDownDriver(suite.T(), suite.driver)
 	suite.cnxn = nil
-	suite.NoError(suite.db.Close())
+	if suite.db != nil {
+		suite.NoError(suite.db.Close(suite.ctx))
+	}
 	suite.db = nil
 	suite.driver = nil
 }
@@ -656,12 +624,12 @@ func (suite *BigQueryTests) TestDropSchema() {
 	schema := fmt.Sprintf("%s_x", suite.Quirks.DBSchema())
 
 	// Create unique schema to drop via a query
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("CREATE SCHEMA %s", schema)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("CREATE SCHEMA %s", schema)))
 	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	rdr.Release()
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("DROP SCHEMA %s CASCADE", schema)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("DROP SCHEMA %s CASCADE", schema)))
 	rdr, _, err = suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	rdr.Release()
@@ -672,42 +640,42 @@ func (suite *BigQueryTests) TestDropSchema() {
 
 func (suite *BigQueryTests) TestCreateView() {
 	// Create unique schema to drop via a query
-	suite.Require().NoError(suite.stmt.SetSqlQuery("CREATE TABLE IF NOT EXISTS a (id int)"))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE TABLE IF NOT EXISTS a (id int)"))
 	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	rdr.Release()
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery("CREATE VIEW IF NOT EXISTS a_view AS SELECT * FROM a"))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "CREATE VIEW IF NOT EXISTS a_view AS SELECT * FROM a"))
 	rdr, _, err = suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	rdr.Release()
 }
 
 func (suite *BigQueryTests) TestNewDatabaseGetSetOptions() {
-	key1, val1 := driver.OptionStringProjectID, "val1"
-	key2, val2 := driver.OptionStringDatasetID, "val2"
+	key1, val1 := driver.OptionProjectID, "val1"
+	key2, val2 := driver.OptionDatasetID, "val2"
 
-	db, err := suite.driver.NewDatabase(map[string]string{
+	db, err := suite.driver.NewDatabaseWithContext(suite.ctx, map[string]string{
 		key1: val1,
 		key2: val2,
 	})
 	suite.NoError(err)
 	suite.NotNil(db)
-	defer validation.CheckedClose(suite.T(), db)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, suite.ctx)
 
-	getSetDB, ok := db.(adbc.GetSetOptions)
+	getSetDB, ok := db.(adbc.GetSetOptionsWithContext)
 	suite.True(ok)
 
-	optVal1, err := getSetDB.GetOption(key1)
+	optVal1, err := getSetDB.GetOption(suite.ctx, key1)
 	suite.NoError(err)
 	suite.Equal(optVal1, val1)
-	optVal2, err := getSetDB.GetOption(key2)
+	optVal2, err := getSetDB.GetOption(suite.ctx, key2)
 	suite.NoError(err)
 	suite.Equal(optVal2, val2)
 }
 
 func (suite *BigQueryTests) TestEmptyResultSet() {
-	suite.Require().NoError(suite.stmt.SetSqlQuery("SELECT * FROM UNNEST([])"))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, "SELECT * FROM UNNEST([])"))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -733,7 +701,7 @@ func (suite *BigQueryTests) TestSqlBulkInsertRecords() {
 	err := suite.Quirks.CreateSampleTableWithRecords(bulkInsertTableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, bulkInsertTableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, bulkInsertTableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -757,11 +725,12 @@ func (suite *BigQueryTests) TestSqlBulkInsertStreams() {
 
 	stream, err := array.NewRecordReader(input, []arrow.RecordBatch{rec})
 	suite.Require().NoError(err)
+	defer stream.Release()
 
 	err = suite.Quirks.CreateSampleTableWithStreams(bulkInsertTableName, stream)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, bulkInsertTableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, bulkInsertTableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -798,18 +767,19 @@ func (suite *BigQueryTests) TestBulkInsertWrite() {
 
 	stream, err := array.NewRecordReader(schema, []arrow.RecordBatch{rec, rec2})
 	suite.Require().NoError(err)
+	defer stream.Release()
 
 	suite.Require().NoError(suite.stmt.BindStream(suite.ctx, stream))
-	suite.Require().NoError(suite.stmt.SetOption(adbc.OptionKeyIngestTargetTable, table))
-	suite.Require().NoError(suite.stmt.SetOption(adbc.OptionValueIngestTargetDBSchema, suite.Quirks.DBSchema()))
-	suite.Require().NoError(suite.stmt.SetOption(adbc.OptionKeyIngestMode, adbc.OptionValueIngestModeReplace))
-	suite.Require().NoError(suite.stmt.SetOption(driver.OptionStringBulkIngestMethod, driver.OptionValueBulkIngestMethodStorageWrite))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestTargetTable, table))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionValueIngestTargetDBSchema, suite.Quirks.DBSchema()))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, adbc.OptionKeyIngestMode, adbc.OptionValueIngestModeReplace))
+	suite.Require().NoError(suite.stmt.SetOption(suite.ctx, driver.OptionBulkIngestMethod, driver.OptionValueBulkIngestMethodStorageWrite))
 	_, err = suite.stmt.ExecuteUpdate(suite.ctx)
 	suite.Require().NoError(err)
 
-	suite.ctx = context.Background()
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT strs FROM `%s.%s` ORDER BY `ints` ASC", suite.Quirks.schemaName, table)))
-	rdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
+	ctx := context.Background()
+	suite.Require().NoError(suite.stmt.SetSqlQuery(ctx, fmt.Sprintf("SELECT strs FROM `%s.%s` ORDER BY `ints` ASC", suite.Quirks.schemaName, table)))
+	rdr, _, err := suite.stmt.ExecuteQuery(ctx)
 	suite.Require().NoError(err)
 	suite.Require().NotNil(rdr)
 	defer rdr.Release()
@@ -877,7 +847,7 @@ func (suite *BigQueryTests) TestSqlIngestTimestampTypes() {
 	err := suite.Quirks.CreateSampleTableWithRecords(tableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -987,7 +957,7 @@ func (suite *BigQueryTests) TestSqlIngestDate64Type() {
 	err := suite.Quirks.CreateSampleTableWithRecords(tableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -1092,7 +1062,7 @@ func (suite *BigQueryTests) TestSqlIngestDecimal() {
 	err = suite.Quirks.CreateSampleTableWithRecords(tableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -1227,7 +1197,7 @@ func (suite *BigQueryTests) TestSqlIngestListType() {
 	err := suite.Quirks.CreateSampleTableWithRecords(tableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -1335,7 +1305,7 @@ func (suite *BigQueryTests) TestSqlIngestStructType() {
 	err := suite.Quirks.CreateSampleTableWithRecords(tableName, rec)
 	suite.Require().NoError(err)
 
-	suite.Require().NoError(suite.stmt.SetSqlQuery(fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, fmt.Sprintf("SELECT * FROM `%s.%s` ORDER BY `col_int64` ASC", suite.Quirks.schemaName, tableName)))
 	rdr, n, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	defer rdr.Release()
@@ -1628,11 +1598,12 @@ func TestAuthTypeConsolidation(t *testing.T) {
 	defer mem.AssertSize(t, 0)
 
 	drv := driver.NewDriver(mem)
-	db, err := drv.NewDatabase(nil)
+	ctx := context.Background()
+	db, err := drv.NewDatabaseWithContext(ctx, nil)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
-	defer validation.CheckedClose(t, db)
+	defer testutil.CheckedCloseWithContext(t, db, ctx)
 
 	// Test all valid auth types
 	validAuthTypes := []string{
@@ -1644,14 +1615,14 @@ func TestAuthTypeConsolidation(t *testing.T) {
 	}
 
 	for _, authType := range validAuthTypes {
-		err := db.SetOptions(map[string]string{driver.OptionStringAuthType: authType})
+		err := db.SetOptions(ctx, map[string]string{driver.OptionAuthType: authType})
 		if err != nil {
 			t.Errorf("Failed to set auth type %s: %v", authType, err)
 		}
 	}
 
 	// Test invalid auth type
-	err = db.SetOptions(map[string]string{driver.OptionStringAuthType: "invalid_auth_type"})
+	err = db.SetOptions(ctx, map[string]string{driver.OptionAuthType: "invalid_auth_type"})
 	if err == nil {
 		t.Error("Expected error for invalid auth type")
 	} else if !strings.Contains(err.Error(), "unknown database auth type value") {
@@ -1665,10 +1636,10 @@ type BigQueryTestSuite struct {
 	dataset string
 	mem     *memory.CheckedAllocator
 	ctx     context.Context
-	driver  adbc.Driver
-	db      adbc.Database
-	cnxn    adbc.Connection
-	stmt    adbc.Statement
+	driver  driverbase.DriverWithContext
+	db      adbc.DatabaseWithContext
+	cnxn    adbc.ConnectionWithContext
+	stmt    adbc.StatementWithContext
 }
 
 func (s *BigQueryTestSuite) SetupSuite() {
@@ -1678,9 +1649,9 @@ func (s *BigQueryTestSuite) SetupSuite() {
 	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 
 	s.driver = driver.NewDriver(s.mem)
-	s.db, err = s.driver.NewDatabase(map[string]string{
-		driver.OptionStringProjectID: s.project,
-		driver.OptionStringDatasetID: s.dataset,
+	s.db, err = s.driver.NewDatabaseWithContext(s.ctx, map[string]string{
+		driver.OptionProjectID: s.project,
+		driver.OptionDatasetID: s.dataset,
 	})
 	s.NoError(err)
 
@@ -1694,19 +1665,19 @@ func (s *BigQueryTestSuite) SetupSuite() {
 	s.cnxn, err = s.db.Open(s.ctx)
 	s.NoError(err)
 
-	s.stmt, err = s.cnxn.NewStatement()
+	s.stmt, err = s.cnxn.NewStatement(s.ctx)
 	s.NoError(err)
 }
 
 func (s *BigQueryTestSuite) TearDownSuite() {
 	if s.stmt != nil {
-		s.NoError(s.stmt.Close())
+		s.NoError(s.stmt.Close(s.ctx))
 	}
 	if s.cnxn != nil {
-		s.NoError(s.cnxn.Close())
+		s.NoError(s.cnxn.Close(s.ctx))
 	}
 	if s.db != nil {
-		s.NoError(s.db.Close())
+		s.NoError(s.db.Close(s.ctx))
 	}
 	s.mem.AssertSize(s.T(), 0)
 }
@@ -1725,7 +1696,6 @@ func TestBigQueryURIParsing(t *testing.T) {
 		expectedLocation             string
 		expectedEndpoint             string
 		expectedQuotaProject         string
-		expectedTableID              string
 		expectedImpersonateTarget    string
 		expectedImpersonateLifetime  string
 		expectedImpersonateDelegates string
@@ -1847,11 +1817,10 @@ func TestBigQueryURIParsing(t *testing.T) {
 		},
 		{
 			name:              "table id parameter",
-			uri:               "bigquery:///my-project-123?OAuthType=0&DatasetId=test&TableId=my_table",
+			uri:               "bigquery:///my-project-123?OAuthType=0&DatasetId=test",
 			expectedProjectID: "my-project-123",
 			expectedDatasetID: "test",
 			expectedAuthType:  driver.OptionValueAuthTypeAppDefaultCredentials,
-			expectedTableID:   "my_table",
 		},
 		{
 			name:                        "impersonation parameters",
@@ -1891,13 +1860,12 @@ func TestBigQueryURIParsing(t *testing.T) {
 		},
 		{
 			name:                      "all optional parameters",
-			uri:                       "bigquery:///my-project-123?OAuthType=0&DatasetId=analytics&Location=EU&QuotaProject=billing&TableId=orders&ImpersonateTargetPrincipal=svc@example.com",
+			uri:                       "bigquery:///my-project-123?OAuthType=0&DatasetId=analytics&Location=EU&QuotaProject=billing&ImpersonateTargetPrincipal=svc@example.com",
 			expectedProjectID:         "my-project-123",
 			expectedDatasetID:         "analytics",
 			expectedAuthType:          driver.OptionValueAuthTypeAppDefaultCredentials,
 			expectedLocation:          "EU",
 			expectedQuotaProject:      "billing",
-			expectedTableID:           "orders",
 			expectedImpersonateTarget: "svc@example.com",
 		},
 		{
@@ -1968,56 +1936,53 @@ func TestBigQueryURIParsing(t *testing.T) {
 			require.NoError(t, err, "unexpected error during URI parsing")
 
 			if tt.expectedProjectID != "" {
-				assert.Equal(t, tt.expectedProjectID, params[driver.OptionStringProjectID], "project ID mismatch")
+				assert.Equal(t, tt.expectedProjectID, params[driver.OptionProjectID], "project ID mismatch")
 			}
 
 			if tt.expectedDatasetID != "" {
-				assert.Equal(t, tt.expectedDatasetID, params[driver.OptionStringDatasetID], "dataset ID mismatch")
+				assert.Equal(t, tt.expectedDatasetID, params[driver.OptionDatasetID], "dataset ID mismatch")
 			}
 
 			if tt.expectedAuthType != "" {
-				assert.Equal(t, tt.expectedAuthType, params[driver.OptionStringAuthType], "auth type mismatch")
+				assert.Equal(t, tt.expectedAuthType, params[driver.OptionAuthType], "auth type mismatch")
 			}
 
 			if tt.expectedCredentials != "" {
-				assert.Equal(t, tt.expectedCredentials, params[driver.OptionStringAuthCredentials], "credentials mismatch")
+				assert.Equal(t, tt.expectedCredentials, params[driver.OptionAuthCredentials], "credentials mismatch")
 			}
 
 			if tt.expectedClientID != "" {
-				assert.Equal(t, tt.expectedClientID, params[driver.OptionStringAuthClientID], "client ID mismatch")
+				assert.Equal(t, tt.expectedClientID, params[driver.OptionAuthClientID], "client ID mismatch")
 			}
 
 			if tt.expectedClientSecret != "" {
-				assert.Equal(t, tt.expectedClientSecret, params[driver.OptionStringAuthClientSecret], "client secret mismatch")
+				assert.Equal(t, tt.expectedClientSecret, params[driver.OptionAuthClientSecret], "client secret mismatch")
 			}
 
 			if tt.expectedRefreshToken != "" {
-				assert.Equal(t, tt.expectedRefreshToken, params[driver.OptionStringAuthRefreshToken], "refresh token mismatch")
+				assert.Equal(t, tt.expectedRefreshToken, params[driver.OptionAuthRefreshToken], "refresh token mismatch")
 			}
 
 			if tt.expectedLocation != "" {
-				assert.Equal(t, tt.expectedLocation, params[driver.OptionStringLocation], "location mismatch")
+				assert.Equal(t, tt.expectedLocation, params[driver.OptionLocation], "location mismatch")
 			}
 			if tt.expectedEndpoint != "" {
-				assert.Equal(t, tt.expectedEndpoint, params[driver.OptionStringEndpoint], "endpoint mismatch")
+				assert.Equal(t, tt.expectedEndpoint, params[driver.OptionEndpoint], "endpoint mismatch")
 			}
 			if tt.expectedQuotaProject != "" {
-				assert.Equal(t, tt.expectedQuotaProject, params[driver.OptionStringAuthQuotaProject], "quota project mismatch")
-			}
-			if tt.expectedTableID != "" {
-				assert.Equal(t, tt.expectedTableID, params[driver.OptionStringTableID], "table ID mismatch")
+				assert.Equal(t, tt.expectedQuotaProject, params[driver.OptionAuthQuotaProject], "quota project mismatch")
 			}
 			if tt.expectedImpersonateTarget != "" {
-				assert.Equal(t, tt.expectedImpersonateTarget, params[driver.OptionStringImpersonateTargetPrincipal], "impersonate target mismatch")
+				assert.Equal(t, tt.expectedImpersonateTarget, params[driver.OptionImpersonateTargetPrincipal], "impersonate target mismatch")
 			}
 			if tt.expectedImpersonateLifetime != "" {
-				assert.Equal(t, tt.expectedImpersonateLifetime, params[driver.OptionStringImpersonateLifetime], "impersonate lifetime mismatch")
+				assert.Equal(t, tt.expectedImpersonateLifetime, params[driver.OptionImpersonateLifetime], "impersonate lifetime mismatch")
 			}
 			if tt.expectedImpersonateDelegates != "" {
-				assert.Equal(t, tt.expectedImpersonateDelegates, params[driver.OptionStringImpersonateDelegates], "impersonate delegates mismatch")
+				assert.Equal(t, tt.expectedImpersonateDelegates, params[driver.OptionImpersonateDelegates], "impersonate delegates mismatch")
 			}
 			if tt.expectedImpersonateScopes != "" {
-				assert.Equal(t, tt.expectedImpersonateScopes, params[driver.OptionStringImpersonateScopes], "impersonate scopes mismatch")
+				assert.Equal(t, tt.expectedImpersonateScopes, params[driver.OptionImpersonateScopes], "impersonate scopes mismatch")
 			}
 		})
 	}
@@ -2026,7 +1991,7 @@ func TestBigQueryURIParsing(t *testing.T) {
 func (suite *BigQueryTests) TestGetStatistics() {
 	// Create a persistent test table (if not exists) to ensure consistent results
 	// across test runs despite INFORMATION_SCHEMA staleness
-	suite.Require().NoError(suite.stmt.SetSqlQuery(`
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `
 		CREATE TABLE IF NOT EXISTS statistics_test (
 			id INT64,
 			category STRING,
@@ -2038,7 +2003,7 @@ func (suite *BigQueryTests) TestGetStatistics() {
 	suite.Require().NoError(err)
 
 	// Check if table is empty, if so populate it with 300 rows
-	suite.Require().NoError(suite.stmt.SetSqlQuery(`SELECT COUNT(*) FROM statistics_test`))
+	suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `SELECT COUNT(*) FROM statistics_test`))
 	countRdr, _, err := suite.stmt.ExecuteQuery(suite.ctx)
 	suite.Require().NoError(err)
 	suite.Require().True(countRdr.Next())
@@ -2046,7 +2011,7 @@ func (suite *BigQueryTests) TestGetStatistics() {
 	countRdr.Release()
 
 	if count == 0 {
-		suite.Require().NoError(suite.stmt.SetSqlQuery(`
+		suite.Require().NoError(suite.stmt.SetSqlQuery(suite.ctx, `
 			INSERT INTO statistics_test
 			SELECT
 				row_num as id,
@@ -2169,4 +2134,169 @@ func (suite *BigQueryTests) TestGetStatisticNames() {
 	suite.True(rdr.Next())
 	rec := rdr.RecordBatch()
 	suite.Equal(int64(8), rec.NumRows())
+}
+
+func (suite *BigQueryTests) TestOldOptionNames() {
+	ctx := context.Background()
+	stmtGS := suite.stmt.(adbc.GetSetOptionsWithContext)
+	for _, k := range []string{
+		"adbc.bigquery.sql.query.max_billing_tier",
+		"adbc.bigquery.sql.query.max_bytes_billed",
+		"adbc.bigquery.sql.query.job_timeout",
+		"adbc.bigquery.sql.query.result_buffer_size",
+		"adbc.bigquery.sql.query.prefetch_concurrency",
+	} {
+		suite.Run("int/"+k, func() {
+			expected := int64(12)
+			suite.NoError(stmtGS.SetOptionInt(ctx, k, expected))
+			v, err := stmtGS.GetOptionInt(ctx, k)
+			suite.NoError(err)
+			suite.Equal(expected, v)
+		})
+	}
+
+	type opt struct {
+		k, v string
+		a    *string
+	}
+
+	for _, o := range []opt{
+		{k: "adbc.bigquery.sql.query.default_dataset_id", v: "foobar"},
+		{k: "adbc.bigquery.sql.query.default_project_id", v: "foobar"},
+		{k: "adbc.bigquery.sql.query.destination_table", v: "foobar", a: new(fmt.Sprintf("%s.%s.foobar", suite.Quirks.catalogName, suite.Quirks.schemaName))},
+		{k: "adbc.bigquery.sql.query.parameter_mode", v: "adbc.bigquery.sql.query.parameter_mode_named", a: new("named")},
+		{k: "adbc.bigquery.sql.query.parameter_mode", v: "adbc.bigquery.sql.query.parameter_mode_positional", a: new("positional")},
+		{k: "adbc.bigquery.sql.query.create_disposition", v: "CREATE_IF_NEEDED"},
+		{k: "adbc.bigquery.sql.query.write_disposition", v: "WRITE_APPEND"},
+		{k: "adbc.bigquery.sql.query.disable_query_cache", v: "true"},
+		{k: "adbc.bigquery.sql.query.disable_flattened_results", v: "true"},
+		{k: "adbc.bigquery.sql.query.allow_large_results", v: "true"},
+		{k: "adbc.bigquery.sql.query.priority", v: "BATCH"},
+		{k: "adbc.bigquery.sql.query.use_legacy_sql", v: "true"},
+		{k: "adbc.bigquery.sql.query.dry_run", v: "true"},
+		{k: "adbc.bigquery.sql.query.create_session", v: "true"},
+	} {
+		suite.Run("string/"+o.k, func() {
+			suite.NoError(stmtGS.SetOption(ctx, o.k, o.v))
+			v, err := stmtGS.GetOption(ctx, o.k)
+			suite.NoError(err)
+			expected := o.v
+			if o.a != nil {
+				expected = *o.a
+			}
+			suite.Equal(expected, v)
+		})
+	}
+
+	cnxnGS := suite.cnxn.(adbc.GetSetOptionsWithContext)
+	for _, k := range []string{
+		"adbc.bigquery.sql.query.result_buffer_size",
+		"adbc.bigquery.sql.query.prefetch_concurrency",
+	} {
+		suite.Run("connection/int/"+k, func() {
+			expected := int64(12)
+			suite.NoError(cnxnGS.SetOptionInt(ctx, k, expected))
+			v, err := cnxnGS.GetOptionInt(ctx, k)
+			suite.NoError(err)
+			suite.Equal(expected, v)
+		})
+	}
+
+	for _, o := range []opt{
+		{k: "adbc.bigquery.sql.auth_type", v: "adbc.bigquery.sql.auth_type.anonymous", a: new("anonymous")},
+		{k: "adbc.bigquery.sql.auth_credentials", v: "credentials"},
+		{k: "adbc.bigquery.sql.auth.client_id", v: "client"},
+		{k: "adbc.bigquery.sql.auth.client_secret", v: "secret"},
+		{k: "adbc.bigquery.sql.auth.refresh_token", v: "token"},
+		{k: "adbc.bigquery.sql.auth.quota_project", v: "quota"},
+		{k: "adbc.bigquery.sql.impersonate.lifetime", v: "1800s", a: new("30m0s")},
+	} {
+		suite.Run("connection/string/"+o.k, func() {
+			suite.NoError(cnxnGS.SetOption(ctx, o.k, o.v))
+			v, err := cnxnGS.GetOption(ctx, o.k)
+			suite.NoError(err)
+			expected := o.v
+			if o.a != nil {
+				expected = *o.a
+			}
+			suite.Equal(expected, v)
+		})
+	}
+
+	for _, o := range []opt{
+		{k: "adbc.bigquery.sql.project_id", a: new(suite.Quirks.catalogName)},
+		{k: "adbc.bigquery.sql.dataset_id", a: new(suite.Quirks.schemaName)},
+	} {
+		suite.Run("connection/get/"+o.k, func() {
+			v, err := cnxnGS.GetOption(ctx, o.k)
+			suite.NoError(err)
+			suite.Equal(*o.a, v)
+		})
+	}
+
+	db, err := suite.driver.NewDatabaseWithContext(ctx, nil)
+	suite.Require().NoError(err)
+	defer testutil.CheckedCloseWithContext(suite.T(), db, ctx)
+	dbGS := db.(adbc.GetSetOptionsWithContext)
+
+	for _, o := range []opt{
+		{k: "adbc.bigquery.sql.auth_type", v: "adbc.bigquery.sql.auth_type.anonymous", a: new("anonymous")},
+		{k: "adbc.bigquery.sql.auth_credentials", v: "credentials"},
+		{k: "adbc.bigquery.sql.auth.client_id", v: "client"},
+		{k: "adbc.bigquery.sql.auth.client_secret", v: "secret"},
+		{k: "adbc.bigquery.sql.auth.refresh_token", v: "token"},
+		{k: "adbc.bigquery.sql.auth.quota_project", v: "quota"},
+		{k: "adbc.bigquery.sql.location", v: "US"},
+		{k: "adbc.bigquery.sql.project_id", v: "project"},
+		{k: "adbc.bigquery.sql.dataset_id", v: "dataset"},
+		{k: "adbc.bigquery.sql.endpoint", v: "bigquery.googleapis.com:443"},
+		{k: "adbc.bigquery.sql.storage_endpoint", v: "storage.googleapis.com:443"},
+		{k: "adbc.bigquery.sql.impersonate.lifetime", v: "1800s", a: new("30m0s")},
+	} {
+		suite.Run("database/string/"+o.k, func() {
+			suite.NoError(dbGS.SetOption(ctx, o.k, o.v))
+			v, err := dbGS.GetOption(ctx, o.k)
+			suite.NoError(err)
+			expected := o.v
+			if o.a != nil {
+				expected = *o.a
+			}
+			suite.Equal(expected, v)
+		})
+	}
+}
+
+func TestOldOptionNamesURI(t *testing.T) {
+	params, err := driver.ParseBigQueryURIToParams("bigquery:///project?OAuthType=3&AuthClientId=client&AuthClientSecret=secret&AuthRefreshToken=token&DatasetId=dataset&Location=US&QuotaProject=quota&ImpersonateTargetPrincipal=svc@example.com&ImpersonateDelegates=delegate@example.com&ImpersonateScopes=scope&ImpersonateLifetime=1800s")
+	require.NoError(t, err)
+
+	assert.Equal(t, "project", params[driver.OptionProjectID])
+	assert.Equal(t, driver.OptionValueAuthTypeUserAuthentication, params[driver.OptionAuthType])
+	assert.Equal(t, "client", params[driver.OptionAuthClientID])
+	assert.Equal(t, "secret", params[driver.OptionAuthClientSecret])
+	assert.Equal(t, "token", params[driver.OptionAuthRefreshToken])
+	assert.Equal(t, "dataset", params[driver.OptionDatasetID])
+	assert.Equal(t, "US", params[driver.OptionLocation])
+	assert.Equal(t, "quota", params[driver.OptionAuthQuotaProject])
+	assert.Equal(t, "svc@example.com", params[driver.OptionImpersonateTargetPrincipal])
+	assert.Equal(t, "delegate@example.com", params[driver.OptionImpersonateDelegates])
+	assert.Equal(t, "scope", params[driver.OptionImpersonateScopes])
+	assert.Equal(t, "1800s", params[driver.OptionImpersonateLifetime])
+
+	for _, oldKey := range []string{
+		"adbc.bigquery.sql.project_id",
+		"adbc.bigquery.sql.auth_type",
+		"adbc.bigquery.sql.auth.client_id",
+		"adbc.bigquery.sql.auth.client_secret",
+		"adbc.bigquery.sql.auth.refresh_token",
+		"adbc.bigquery.sql.dataset_id",
+		"adbc.bigquery.sql.location",
+		"adbc.bigquery.sql.auth.quota_project",
+		"adbc.bigquery.sql.impersonate.target_principal",
+		"adbc.bigquery.sql.impersonate.delegates",
+		"adbc.bigquery.sql.impersonate.scopes",
+		"adbc.bigquery.sql.impersonate.lifetime",
+	} {
+		assert.NotContains(t, params, oldKey)
+	}
 }

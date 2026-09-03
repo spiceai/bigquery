@@ -33,6 +33,7 @@ import (
 
 	"cloud.google.com/go/bigquery"
 	"github.com/adbc-drivers/driverbase-go/driverbase"
+	"github.com/adbc-drivers/driverbase-go/driverbase/arrowext"
 	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -70,28 +71,28 @@ type statement struct {
 	activeJob *jobCancellation
 }
 
-func (st *statement) GetOptionBytes(key string) ([]byte, error) {
+func (st *statement) GetOptionBytes(ctx context.Context, key string) ([]byte, error) {
 	return nil, adbc.Error{
 		Msg:  fmt.Sprintf("[BigQuery] Unknown statement option '%s'", key),
 		Code: adbc.StatusNotFound,
 	}
 }
 
-func (st *statement) GetOptionDouble(key string) (float64, error) {
+func (st *statement) GetOptionDouble(ctx context.Context, key string) (float64, error) {
 	return 0, adbc.Error{
 		Msg:  fmt.Sprintf("[BigQuery] Unknown statement option '%s'", key),
 		Code: adbc.StatusNotFound,
 	}
 }
 
-func (st *statement) SetOptionBytes(key string, value []byte) error {
+func (st *statement) SetOptionBytes(ctx context.Context, key string, value []byte) error {
 	return adbc.Error{
 		Msg:  fmt.Sprintf("[BigQuery] Unknown statement option '%s'", key),
 		Code: adbc.StatusNotImplemented,
 	}
 }
 
-func (st *statement) SetOptionDouble(key string, value float64) error {
+func (st *statement) SetOptionDouble(ctx context.Context, key string, value float64) error {
 	return adbc.Error{
 		Msg:  fmt.Sprintf("[BigQuery] Unknown statement option '%s'", key),
 		Code: adbc.StatusNotImplemented,
@@ -102,7 +103,7 @@ func (st *statement) SetOptionDouble(key string, value float64) error {
 // and closes it (particularly if it is a prepared statement).
 //
 // A statement instance should not be used after Close is called.
-func (st *statement) Close() error {
+func (st *statement) Close(ctx context.Context) error {
 	if st.cnxn == nil {
 		return adbc.Error{
 			Msg:  "[bq] statement already closed",
@@ -122,55 +123,56 @@ func (st *statement) Close() error {
 	return cancelErr
 }
 
-func (st *statement) GetOption(key string) (string, error) {
+func (st *statement) GetOption(ctx context.Context, key string) (string, error) {
+	key = remapOption(key)
 	switch key {
-	case OptionStringProjectID:
-		val, err := st.cnxn.GetOption(OptionStringProjectID)
+	case OptionProjectID:
+		val, err := st.cnxn.GetOption(ctx, OptionProjectID)
 		if err != nil {
 			return "", err
 		} else {
 			return val, nil
 		}
-	case OptionStringQueryParameterMode:
+	case OptionQueryParameterMode:
 		return st.parameterMode, nil
-	case OptionStringQueryDestinationTable:
+	case OptionQueryDestinationTable:
 		return tableToString(st.queryConfig.Dst), nil
-	case OptionStringQueryDefaultProjectID:
+	case OptionQueryDefaultProjectID:
 		return st.queryConfig.DefaultProjectID, nil
-	case OptionStringQueryDefaultDatasetID:
+	case OptionQueryDefaultDatasetID:
 		return st.queryConfig.DefaultDatasetID, nil
-	case OptionStringQueryCreateDisposition:
+	case OptionQueryCreateDisposition:
 		return string(st.queryConfig.CreateDisposition), nil
-	case OptionStringQueryWriteDisposition:
+	case OptionQueryWriteDisposition:
 		return string(st.queryConfig.WriteDisposition), nil
-	case OptionBoolQueryDisableQueryCache:
+	case OptionQueryDisableQueryCache:
 		return strconv.FormatBool(st.queryConfig.DisableQueryCache), nil
-	case OptionBoolDisableFlattenedResults:
+	case OptionQueryDisableFlattenedResults:
 		return strconv.FormatBool(st.queryConfig.DisableFlattenedResults), nil
-	case OptionBoolQueryAllowLargeResults:
+	case OptionQueryAllowLargeResults:
 		return strconv.FormatBool(st.queryConfig.AllowLargeResults), nil
-	case OptionStringQueryPriority:
+	case OptionQueryPriority:
 		return string(st.queryConfig.Priority), nil
-	case OptionBoolQueryUseLegacySQL:
+	case OptionQueryUseLegacySQL:
 		return strconv.FormatBool(st.queryConfig.UseLegacySQL), nil
-	case OptionBoolQueryDryRun:
+	case OptionQueryDryRun:
 		return strconv.FormatBool(st.queryConfig.DryRun), nil
-	case OptionBoolQueryCreateSession:
+	case OptionQueryCreateSession:
 		return strconv.FormatBool(st.queryConfig.CreateSession), nil
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		// If set at statement level, return that; otherwise fall back to connection
 		if st.bulkIngestMethod != "" {
 			return st.bulkIngestMethod, nil
 		}
-		return st.cnxn.GetOption(key)
-	case OptionStringBulkIngestCompression:
+		return st.cnxn.GetOption(ctx, key)
+	case OptionBulkIngestCompression:
 		// If set at statement level, return that; otherwise fall back to connection
 		if st.bulkIngestCompression != "" {
 			return st.bulkIngestCompression, nil
 		}
-		return st.cnxn.GetOption(key)
+		return st.cnxn.GetOption(ctx, key)
 	default:
-		val, err := st.cnxn.GetOption(key)
+		val, err := st.cnxn.GetOption(ctx, key)
 		if err == nil {
 			return val, nil
 		}
@@ -178,20 +180,21 @@ func (st *statement) GetOption(key string) (string, error) {
 	}
 }
 
-func (st *statement) GetOptionInt(key string) (int64, error) {
+func (st *statement) GetOptionInt(ctx context.Context, key string) (int64, error) {
+	key = remapOption(key)
 	switch key {
-	case OptionIntQueryMaxBillingTier:
+	case OptionQueryMaxBillingTier:
 		return int64(st.queryConfig.MaxBillingTier), nil
-	case OptionIntQueryMaxBytesBilled:
+	case OptionQueryMaxBytesBilled:
 		return st.queryConfig.MaxBytesBilled, nil
-	case OptionIntQueryJobTimeout:
+	case OptionQueryJobTimeout:
 		return st.queryConfig.JobTimeout.Milliseconds(), nil
-	case OptionIntQueryResultBufferSize:
+	case OptionQueryResultBufferSize:
 		return int64(st.resultRecordBufferSize), nil
-	case OptionIntQueryPrefetchConcurrency:
+	case OptionQueryPrefetchConcurrency:
 		return int64(st.prefetchConcurrency), nil
 	default:
-		val, err := st.cnxn.GetOptionInt(key)
+		val, err := st.cnxn.GetOptionInt(ctx, key)
 		if err == nil {
 			return val, nil
 		}
@@ -199,7 +202,8 @@ func (st *statement) GetOptionInt(key string) (int64, error) {
 	}
 }
 
-func (st *statement) SetOption(key string, v string) error {
+func (st *statement) SetOption(ctx context.Context, key string, v string) error {
+	key = remapOption(key)
 	switch key {
 	case adbc.OptionKeyIngestTargetTable:
 		st.ingest.TableName = v
@@ -229,7 +233,8 @@ func (st *statement) SetOption(key string, v string) error {
 				Code: adbc.StatusInvalidArgument,
 			}
 		}
-	case OptionStringQueryParameterMode:
+	case OptionQueryParameterMode:
+		v = remapOption(v)
 		switch v {
 		case OptionValueQueryParameterModeNamed, OptionValueQueryParameterModePositional:
 			st.parameterMode = v
@@ -239,7 +244,7 @@ func (st *statement) SetOption(key string, v string) error {
 				Msg:  fmt.Sprintf("[bq] Parameter mode for the statement can only be either %s or %s", OptionValueQueryParameterModeNamed, OptionValueQueryParameterModePositional),
 			}
 		}
-	case OptionStringQueryDestinationTable:
+	case OptionQueryDestinationTable:
 		if v == "" {
 			st.queryConfig.Dst = nil
 		} else {
@@ -250,74 +255,74 @@ func (st *statement) SetOption(key string, v string) error {
 				return err
 			}
 		}
-	case OptionStringQueryDefaultProjectID:
+	case OptionQueryDefaultProjectID:
 		st.queryConfig.DefaultProjectID = v
-	case OptionStringQueryDefaultDatasetID:
+	case OptionQueryDefaultDatasetID:
 		st.queryConfig.DefaultDatasetID = v
-	case OptionStringQueryCreateDisposition:
+	case OptionQueryCreateDisposition:
 		val, err := stringToTableCreateDisposition(v)
 		if err == nil {
 			st.queryConfig.CreateDisposition = val
 		} else {
 			return err
 		}
-	case OptionStringQueryWriteDisposition:
+	case OptionQueryWriteDisposition:
 		val, err := stringToTableWriteDisposition(v)
 		if err == nil {
 			st.queryConfig.WriteDisposition = val
 		} else {
 			return err
 		}
-	case OptionBoolQueryDisableQueryCache:
+	case OptionQueryDisableQueryCache:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.DisableQueryCache = val
 		} else {
 			return err
 		}
-	case OptionBoolDisableFlattenedResults:
+	case OptionQueryDisableFlattenedResults:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.DisableFlattenedResults = val
 		} else {
 			return err
 		}
-	case OptionBoolQueryAllowLargeResults:
+	case OptionQueryAllowLargeResults:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.AllowLargeResults = val
 		} else {
 			return err
 		}
-	case OptionStringQueryPriority:
+	case OptionQueryPriority:
 		val, err := stringToQueryPriority(v)
 		if err == nil {
 			st.queryConfig.Priority = val
 		} else {
 			return err
 		}
-	case OptionBoolQueryUseLegacySQL:
+	case OptionQueryUseLegacySQL:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.UseLegacySQL = val
 		} else {
 			return err
 		}
-	case OptionBoolQueryDryRun:
+	case OptionQueryDryRun:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.DryRun = val
 		} else {
 			return err
 		}
-	case OptionBoolQueryCreateSession:
+	case OptionQueryCreateSession:
 		val, err := strconv.ParseBool(v)
 		if err == nil {
 			st.queryConfig.CreateSession = val
 		} else {
 			return err
 		}
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		if v != OptionValueBulkIngestMethodLoad &&
 			v != OptionValueBulkIngestMethodStorageWrite {
 			return adbc.Error{
@@ -326,7 +331,7 @@ func (st *statement) SetOption(key string, v string) error {
 			}
 		}
 		st.bulkIngestMethod = v
-	case OptionStringBulkIngestCompression:
+	case OptionBulkIngestCompression:
 		if v != OptionValueCompressionNone &&
 			v != OptionValueCompressionLZ4 &&
 			v != OptionValueCompressionZSTD {
@@ -346,23 +351,24 @@ func (st *statement) SetOption(key string, v string) error {
 	return nil
 }
 
-func (st *statement) SetOptionInt(key string, value int64) error {
+func (st *statement) SetOptionInt(ctx context.Context, key string, value int64) error {
+	key = remapOption(key)
 	switch key {
-	case OptionIntQueryMaxBillingTier:
+	case OptionQueryMaxBillingTier:
 		st.queryConfig.MaxBillingTier = int(value)
-	case OptionIntQueryMaxBytesBilled:
+	case OptionQueryMaxBytesBilled:
 		st.queryConfig.MaxBytesBilled = value
-	case OptionIntQueryJobTimeout:
+	case OptionQueryJobTimeout:
 		st.queryConfig.JobTimeout = time.Duration(value) * time.Millisecond
-	case OptionIntQueryResultBufferSize:
+	case OptionQueryResultBufferSize:
 		st.resultRecordBufferSize = int(value)
 		return nil
-	case OptionIntQueryPrefetchConcurrency:
+	case OptionQueryPrefetchConcurrency:
 		st.prefetchConcurrency = int(value)
 		return nil
 	default:
 		return adbc.Error{
-			Code: adbc.StatusInvalidArgument,
+			Code: adbc.StatusNotImplemented,
 			Msg:  fmt.Sprintf("[bq] unknown statement string type option `%s`", key),
 		}
 	}
@@ -374,7 +380,7 @@ func (st *statement) SetOptionInt(key string, value int64) error {
 // The query can then be executed with any of the Execute methods.
 // For queries expected to be executed repeatedly, Prepare should be
 // called before execution.
-func (st *statement) SetSqlQuery(query string) error {
+func (st *statement) SetSqlQuery(ctx context.Context, query string) error {
 	st.ingest.TableName = ""
 	st.queryConfig.Q = query
 	return nil
@@ -421,7 +427,7 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (int64, error) {
 	}
 
 	if st.params == nil {
-		_, totalRows, err := runQuery(ctx, st.cnxn.Logger, st.query(), true, st)
+		_, _, totalRows, err := runQuery(ctx, st.cnxn.Logger, st.query(), true, st)
 		if err != nil {
 			return -1, err
 		}
@@ -443,7 +449,7 @@ func (st *statement) ExecuteUpdate(ctx context.Context) (int64, error) {
 					st.queryConfig.Parameters = parameters
 				}
 
-				_, currentRows, err := runQuery(ctx, st.cnxn.Logger, st.query(), true, st)
+				_, _, currentRows, err := runQuery(ctx, st.cnxn.Logger, st.query(), true, st)
 				if err != nil {
 					return -1, err
 				}
@@ -478,10 +484,6 @@ func (st *statement) ExecuteSchema(ctx context.Context) (*arrow.Schema, error) {
 	}
 
 	bqSchema := queryStats.Schema
-	if len(bqSchema) == 0 {
-		return arrow.NewSchema([]arrow.Field{}, nil), nil
-	}
-
 	fields := make([]arrow.Field, len(bqSchema))
 	for i, fieldSchema := range bqSchema {
 		f, err := buildField(fieldSchema, 0)
@@ -491,7 +493,11 @@ func (st *statement) ExecuteSchema(ctx context.Context) (*arrow.Schema, error) {
 		fields[i] = f
 	}
 
-	return arrow.NewSchema(fields, nil), nil
+	metadata, err := metadataFromJobStatistics(status.Statistics)
+	if err != nil {
+		return nil, err
+	}
+	return arrow.NewSchema(fields, metadata), nil
 }
 
 // Prepare turns this statement into a prepared statement to be executed
@@ -516,7 +522,7 @@ func (st *statement) Prepare(_ context.Context) error {
 // Like SetSqlQuery, after this is called the query can be executed
 // using any of the Execute methods. If the query is expected to be
 // executed repeatedly, Prepare should be called first on the statement.
-func (st *statement) SetSubstraitPlan(plan []byte) error {
+func (st *statement) SetSubstraitPlan(ctx context.Context, plan []byte) error {
 	return adbc.Error{
 		Code: adbc.StatusNotImplemented,
 		Msg:  "[bq] Substrait not yet implemented for BigQuery driver",
@@ -557,6 +563,10 @@ func arrowDataTypeToTypeKind(field arrow.Field) (bigquery.StandardSQLDataType, e
 	// https://cloud.google.com/bigquery/docs/reference/storage#arrow_schema_details
 	// https://cloud.google.com/bigquery/docs/reference/rest/v2/StandardSqlDataType#typekind
 	switch field.Type.ID() {
+	case arrow.NULL:
+		return bigquery.StandardSQLDataType{
+			TypeKind: "STRING",
+		}, nil
 	case arrow.BOOL:
 		return bigquery.StandardSQLDataType{
 			TypeKind: "BOOL",
@@ -673,6 +683,8 @@ func arrowValueToQueryParameterValue(field arrow.Field, value arrow.Array, i int
 	}
 
 	switch value.DataType().ID() {
+	case arrow.NULL:
+		qpv.Value = bigquery.NullString{}
 	case arrow.BOOL:
 		if isNull {
 			qpv.Value = bigquery.NullBool{}
@@ -753,7 +765,13 @@ func arrowValueToQueryParameterValue(field arrow.Field, value arrow.Array, i int
 			// cannot use the default format, which will cause errors like
 			//   googleapi: Error 400: Unparsable query parameter `` in type `TYPE_TIME`,
 			//   Invalid time string "00:00:00.000000001" value: '00:00:00.000000001', invalid
-			qpv.Value = value.(*array.Time64).Value(i).FormattedString(arrow.Microsecond)
+			unit := value.DataType().(*arrow.Time64Type).Unit
+			v := value.(*array.Time64).Value(i)
+			if unit == arrow.Nanosecond {
+				// BigQuery TIME only supports up to microsecond precision
+				v = v / 1000
+			}
+			qpv.Value = v.FormattedString(arrow.Microsecond)
 		}
 	case arrow.DECIMAL128, arrow.DECIMAL256:
 		if isNull {
@@ -852,30 +870,6 @@ func (st *statement) clearParameters() {
 	}
 }
 
-// SetParameters takes a record batch to send as the parameter bindings when
-// executing. It should match the schema from ParameterSchema.
-//
-// This will call Retain on the record to ensure it doesn't get released out
-// from under the statement. Release will be called on a previous binding
-// record or reader if it existed, and will be called upon calling Close on the
-// PreparedStatement.
-func (st *statement) SetParameters(binding arrow.RecordBatch) {
-	st.clearParameters()
-	st.params, _ = array.NewRecordReader(binding.Schema(), []arrow.RecordBatch{binding})
-}
-
-// SetRecordReader takes a RecordReader to send as the parameter bindings when
-// executing. It should match the schema from ParameterSchema.
-//
-// This will call Retain on the reader to ensure it doesn't get released out
-// from under the statement. Release will be called on a previous binding
-// record or reader if it existed, and will be called upon calling Close on the
-// PreparedStatement.
-func (st *statement) SetRecordReader(binding array.RecordReader) {
-	st.clearParameters()
-	st.params = binding
-}
-
 // Bind uses an arrow record batch to bind parameters to the query.
 //
 // This can be used for bulk inserts or for prepared statements.
@@ -883,7 +877,15 @@ func (st *statement) SetRecordReader(binding array.RecordReader) {
 // but it may not do this until the statement is closed or another
 // record is bound.
 func (st *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
-	st.SetParameters(values)
+	st.clearParameters()
+	if values != nil {
+		stream, err := array.NewRecordReader(values.Schema(), []arrow.RecordBatch{values})
+		if err != nil {
+			return err
+		}
+		st.params = arrowext.DictDecodeRecordReader(st.alloc, &st.cnxn.ErrorHelper, stream)
+		stream.Release()
+	}
 	return nil
 }
 
@@ -893,7 +895,10 @@ func (st *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
 // The driver will call Release on the record reader, but may not do this
 // until Close is called.
 func (st *statement) BindStream(_ context.Context, stream array.RecordReader) error {
-	st.SetRecordReader(stream)
+	st.clearParameters()
+	if stream != nil {
+		st.params = arrowext.DictDecodeRecordReader(st.alloc, &st.cnxn.ErrorHelper, stream)
+	}
 	return nil
 }
 
@@ -914,7 +919,7 @@ func (st *statement) BindStream(_ context.Context, stream array.RecordReader) er
 //
 // This should return an error with StatusNotImplemented if the schema
 // cannot be determined.
-func (st *statement) GetParameterSchema() (*arrow.Schema, error) {
+func (st *statement) GetParameterSchema(ctx context.Context) (*arrow.Schema, error) {
 	// We could look at UndeclaredParameters but BQ seems to just error if it sees
 	// parameters in a dry run
 	return nil, adbc.Error{
@@ -949,7 +954,7 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 	}
 
 	// Check which implementation to use (statement-level option takes precedence)
-	method, err := st.GetOption(OptionStringBulkIngestMethod)
+	method, err := st.GetOption(ctx, OptionBulkIngestMethod)
 	if err != nil {
 		method = OptionValueBulkIngestMethodLoad
 	}
@@ -995,4 +1000,4 @@ func (st *statement) executeIngest(ctx context.Context) (int64, error) {
 	return manager.ExecuteIngest()
 }
 
-var _ adbc.GetSetOptions = (*statement)(nil)
+var _ adbc.GetSetOptionsWithContext = (*statement)(nil)

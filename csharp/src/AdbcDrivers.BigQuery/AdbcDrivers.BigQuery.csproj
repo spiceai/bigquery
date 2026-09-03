@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFrameworks Condition="'$(IsWindows)'=='true'">netstandard2.0;net472;net8.0</TargetFrameworks>
+		<TargetFrameworks Condition="'$(TargetFrameworks)'==''">netstandard2.0;net8.0</TargetFrameworks>
+		<PackageReadmeFile>readme.md</PackageReadmeFile>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="System.Net.Http.WinHttpHandler" Condition="!$([MSBuild]::IsTargetFrameworkCompatible($(TargetFramework), 'net6.0'))" />
+		<PackageReference Include="Google.Cloud.BigQuery.Storage.V1" />
+		<PackageReference Include="Google.Cloud.BigQuery.V2" />
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Apache.Arrow.Adbc" />
+		<PackageReference Include="Apache.Arrow.Adbc.Telemetry.Traces.Listeners" />
+	</ItemGroup>
+	<ItemGroup Condition="!$([MSBuild]::IsTargetFrameworkCompatible($(TargetFramework), 'net6.0'))">
+		<PackageReference Include="System.Text.Json" />
+	</ItemGroup>
+	<ItemGroup>
+		<Content Include="readme.md">
+			<Pack>true</Pack>
+			<PackagePath>\</PackagePath>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
+</Project>

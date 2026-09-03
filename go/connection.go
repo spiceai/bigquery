@@ -45,6 +45,8 @@ import (
 	"google.golang.org/api/impersonate"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type connectionImpl struct {
@@ -69,10 +71,9 @@ type connectionImpl struct {
 	catalog string
 	// dbSchema is the same as the dataset id in BigQuery
 	dbSchema string
-	// tableID is the default table for statement
-	tableID string
 	// endpoint is the custom BigQuery API endpoint
-	endpoint string
+	endpoint        string
+	storageEndpoint string
 
 	sessionID *string
 
@@ -277,28 +278,33 @@ type bigQueryTokenResponse struct {
 }
 
 // GetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentCatalog() (string, error) {
+func (c *connectionImpl) GetCurrentCatalog(ctx context.Context) (string, error) {
 	return c.catalog, nil
 }
 
 // GetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) GetCurrentDbSchema() (string, error) {
+func (c *connectionImpl) GetCurrentDbSchema(ctx context.Context) (string, error) {
 	return c.dbSchema, nil
 }
 
 // SetCurrentCatalog implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentCatalog(value string) error {
+func (c *connectionImpl) SetCurrentCatalog(ctx context.Context, value string) error {
+	// TODO: is this really possible? we may have to recreate client
 	c.catalog = value
 	return nil
 }
 
 // SetCurrentDbSchema implements driverbase.CurrentNamespacer.
-func (c *connectionImpl) SetCurrentDbSchema(value string) error {
+func (c *connectionImpl) SetCurrentDbSchema(ctx context.Context, value string) error {
 	sanitized, err := sanitizeDataset(value)
 	if err != nil {
 		return err
 	}
 	c.dbSchema = sanitized
+	// Check that the dataset exists
+	if _, err := c.client.DatasetInProject(c.catalog, c.dbSchema).Metadata(ctx); err != nil {
+		return errToAdbcErr(adbc.StatusInvalidArgument, err, "set current db schema to %s", quoteIdentifier(value))
+	}
 	return nil
 }
 
@@ -344,9 +350,7 @@ func (c *connectionImpl) exec(ctx context.Context, stmt string, config func(*big
 }
 
 // SetAutocommit implements driverbase.AutocommitSetter.
-func (c *connectionImpl) SetAutocommit(enabled bool) error {
-	// TODO(https://github.com/apache/arrow-adbc/issues/2772)
-	ctx := context.Background()
+func (c *connectionImpl) SetAutocommit(ctx context.Context, enabled bool) error {
 	if enabled {
 		if c.sessionID == nil {
 			// This should never happen
@@ -429,7 +433,7 @@ func (c *connectionImpl) Rollback(ctx context.Context) error {
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *connectionImpl) Close() error {
+func (c *connectionImpl) Close(ctx context.Context) error {
 	err := c.client.Close()
 	if err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "close client")
@@ -547,7 +551,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 }
 
 // NewStatement initializes a new statement object tied to this connection
-func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
+func (c *connectionImpl) NewStatement(ctx context.Context) (adbc.StatementWithContext, error) {
 	return &statement{
 		alloc:                  c.Alloc,
 		cnxn:                   c,
@@ -562,29 +566,28 @@ func (c *connectionImpl) NewStatement() (adbc.Statement, error) {
 	}, nil
 }
 
-func (c *connectionImpl) GetOption(key string) (string, error) {
+func (c *connectionImpl) GetOption(ctx context.Context, key string) (string, error) {
+	key = remapOption(key)
 	switch key {
-	case OptionStringAuthType:
+	case OptionAuthType:
 		return c.authType, nil
 	case OptionAuthCredentialsType:
 		return string(c.credentialsType), nil
-	case OptionStringAuthCredentials:
+	case OptionAuthCredentials:
 		return c.credentials, nil
-	case OptionStringAuthClientID:
+	case OptionAuthClientID:
 		return c.clientID, nil
-	case OptionStringAuthClientSecret:
+	case OptionAuthClientSecret:
 		return c.clientSecret, nil
-	case OptionStringAuthRefreshToken:
+	case OptionAuthRefreshToken:
 		return c.refreshToken, nil
-	case OptionStringAuthQuotaProject:
+	case OptionAuthQuotaProject:
 		return c.quotaProject, nil
-	case OptionStringProjectID:
+	case OptionProjectID:
 		return c.catalog, nil
-	case OptionStringDatasetID:
+	case OptionDatasetID:
 		return c.dbSchema, nil
-	case OptionStringTableID:
-		return c.tableID, nil
-	case OptionStringImpersonateLifetime:
+	case OptionImpersonateLifetime:
 		if c.impersonateLifetime == 0 {
 			// If no lifetime is set but impersonation is enabled, return the default
 			if c.hasImpersonationOptions() {
@@ -593,24 +596,26 @@ func (c *connectionImpl) GetOption(key string) (string, error) {
 			return "", nil
 		}
 		return c.impersonateLifetime.String(), nil
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		if c.bulkIngestMethod == "" {
 			return OptionValueBulkIngestMethodLoad, nil
 		}
 		return c.bulkIngestMethod, nil
-	case OptionStringBulkIngestCompression:
+	case OptionBulkIngestCompression:
 		if c.bulkIngestCompression == "" {
 			return OptionValueCompressionNone, nil
 		}
 		return c.bulkIngestCompression, nil
 	default:
-		return c.ConnectionImplBase.GetOption(key)
+		return c.ConnectionImplBase.GetOption(ctx, key)
 	}
 }
 
-func (c *connectionImpl) SetOption(key string, value string) error {
+func (c *connectionImpl) SetOption(ctx context.Context, key string, value string) error {
+	key = remapOption(key)
 	switch key {
-	case OptionStringAuthType:
+	case OptionAuthType:
+		value = remapOption(value)
 		c.authType = value
 	case OptionAuthCredentialsType:
 		// N.B. ExternalAccountAuthorizedUser, GDCHServiceAccount aren't re-exported by google.golang.org/api/option
@@ -629,32 +634,32 @@ func (c *connectionImpl) SetOption(key string, value string) error {
 				Msg:  fmt.Sprintf("[bq] unknown %s=%s", key, value),
 			}
 		}
-	case OptionStringAuthCredentials:
+	case OptionAuthCredentials:
 		c.credentials = value
-	case OptionStringAuthClientID:
+	case OptionAuthClientID:
 		c.clientID = value
-	case OptionStringAuthClientSecret:
+	case OptionAuthClientSecret:
 		c.clientSecret = value
-	case OptionStringAuthRefreshToken:
+	case OptionAuthRefreshToken:
 		c.refreshToken = value
-	case OptionStringAuthQuotaProject:
+	case OptionAuthQuotaProject:
 		c.quotaProject = value
-	case OptionStringImpersonateTargetPrincipal:
+	case OptionImpersonateTargetPrincipal:
 		c.impersonateTargetPrincipal = value
-	case OptionStringImpersonateDelegates:
+	case OptionImpersonateDelegates:
 		c.impersonateDelegates = strings.Split(value, ",")
-	case OptionStringImpersonateScopes:
+	case OptionImpersonateScopes:
 		c.impersonateScopes = strings.Split(value, ",")
-	case OptionStringImpersonateLifetime:
+	case OptionImpersonateLifetime:
 		dur, err := time.ParseDuration(value)
 		if err != nil {
 			return adbc.Error{
 				Code: adbc.StatusInvalidArgument,
-				Msg:  fmt.Sprintf("Invalid duration string for %s: %s", OptionStringImpersonateLifetime, err.Error()),
+				Msg:  fmt.Sprintf("Invalid duration string for %s: %s", OptionImpersonateLifetime, err.Error()),
 			}
 		}
 		c.impersonateLifetime = dur
-	case OptionStringBulkIngestMethod:
+	case OptionBulkIngestMethod:
 		if value != OptionValueBulkIngestMethodLoad &&
 			value != OptionValueBulkIngestMethodStorageWrite {
 			return adbc.Error{
@@ -663,7 +668,7 @@ func (c *connectionImpl) SetOption(key string, value string) error {
 			}
 		}
 		c.bulkIngestMethod = value
-	case OptionStringBulkIngestCompression:
+	case OptionBulkIngestCompression:
 		if value != OptionValueCompressionNone &&
 			value != OptionValueCompressionLZ4 &&
 			value != OptionValueCompressionZSTD {
@@ -674,32 +679,34 @@ func (c *connectionImpl) SetOption(key string, value string) error {
 		}
 		c.bulkIngestCompression = value
 	default:
-		return c.ConnectionImplBase.SetOption(key, value)
+		return c.ConnectionImplBase.SetOption(ctx, key, value)
 	}
 	return nil
 }
 
-func (c *connectionImpl) GetOptionInt(key string) (int64, error) {
+func (c *connectionImpl) GetOptionInt(ctx context.Context, key string) (int64, error) {
+	key = remapOption(key)
 	switch key {
-	case OptionIntQueryResultBufferSize:
+	case OptionQueryResultBufferSize:
 		return int64(c.resultRecordBufferSize), nil
-	case OptionIntQueryPrefetchConcurrency:
+	case OptionQueryPrefetchConcurrency:
 		return int64(c.prefetchConcurrency), nil
 	default:
-		return c.ConnectionImplBase.GetOptionInt(key)
+		return c.ConnectionImplBase.GetOptionInt(ctx, key)
 	}
 }
 
-func (c *connectionImpl) SetOptionInt(key string, value int64) error {
+func (c *connectionImpl) SetOptionInt(ctx context.Context, key string, value int64) error {
+	key = remapOption(key)
 	switch key {
-	case OptionIntQueryResultBufferSize:
+	case OptionQueryResultBufferSize:
 		c.resultRecordBufferSize = int(value)
 		return nil
-	case OptionIntQueryPrefetchConcurrency:
+	case OptionQueryPrefetchConcurrency:
 		c.prefetchConcurrency = int(value)
 		return nil
 	default:
-		return c.ConnectionImplBase.SetOptionInt(key, value)
+		return c.ConnectionImplBase.SetOptionInt(ctx, key, value)
 	}
 }
 
@@ -750,19 +757,19 @@ func (c *connectionImpl) newClient(ctx context.Context) error {
 		if c.clientID == "" {
 			return adbc.Error{
 				Code: adbc.StatusInvalidArgument,
-				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionStringAuthClientID),
+				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionAuthClientID),
 			}
 		}
 		if c.clientSecret == "" {
 			return adbc.Error{
 				Code: adbc.StatusInvalidArgument,
-				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionStringAuthClientSecret),
+				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionAuthClientSecret),
 			}
 		}
 		if c.refreshToken == "" {
 			return adbc.Error{
 				Code: adbc.StatusInvalidArgument,
-				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionStringAuthRefreshToken),
+				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty", OptionAuthRefreshToken),
 			}
 		}
 		c.Logger.Debug("Using user OAuth authentication")
@@ -771,6 +778,9 @@ func (c *connectionImpl) newClient(ctx context.Context) error {
 		c.Logger.Debug("Using Application Default Credentials (ADC)", "authType", c.authType)
 		// Use Application Default Credentials (default behavior)
 		// No additional options needed - ADC is used by default
+	case OptionValueAuthTypeAnonymous:
+		c.Logger.Debug("Using anonymous authentication")
+		authOptions = append(authOptions, option.WithoutAuthentication())
 	default:
 		return adbc.Error{
 			Code: adbc.StatusInvalidArgument,
@@ -788,7 +798,7 @@ func (c *connectionImpl) newClient(ctx context.Context) error {
 		if c.impersonateTargetPrincipal == "" {
 			return adbc.Error{
 				Code: adbc.StatusInvalidArgument,
-				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty for impersonation", OptionStringImpersonateTargetPrincipal),
+				Msg:  fmt.Sprintf("[bq] `%s` parameter is empty for impersonation", OptionImpersonateTargetPrincipal),
 			}
 		}
 
@@ -833,7 +843,13 @@ func (c *connectionImpl) newClient(ctx context.Context) error {
 	}
 
 	// Use original authOptions without custom endpoint for Storage Read API
-	err = client.EnableStorageReadClient(ctx, authOptions...)
+	storageAuthOptions := authOptions
+	if c.storageEndpoint != "" {
+		storageAuthOptions = append(storageAuthOptions, option.WithEndpoint(c.storageEndpoint))
+		// assume insecure since the purpose of this is to use the emulator, which does not use TLS
+		storageAuthOptions = append(storageAuthOptions, option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
+	}
+	err = client.EnableStorageReadClient(ctx, storageAuthOptions...)
 	if err != nil {
 		return errToAdbcErr(adbc.StatusIO, err, "enable storage read client")
 	}
@@ -895,7 +911,7 @@ func (c *connectionImpl) getTableSchemaWithFilter(ctx context.Context, catalog *
 
 	md, err := c.client.DatasetInProject(*catalog, *dbSchema).Table(tableName).Metadata(ctx)
 	if err != nil {
-		return nil, err
+		return nil, errToAdbcErr(adbc.StatusUnknown, err, "get metadata for table %s.%s.%s", quoteIdentifier(*catalog), quoteIdentifier(*dbSchema), quoteIdentifier(tableName))
 	}
 
 	metadata := make(map[string]string)
@@ -1059,10 +1075,13 @@ func buildField(schema *bigquery.FieldSchema, level uint) (arrow.Field, error) {
 		switch schema.RangeElementType.Type {
 		case bigquery.DateFieldType:
 			childType = arrow.FixedWidthTypes.Date32
+			richSqlType = "RANGE<DATE>"
 		case bigquery.DateTimeFieldType:
 			childType = &arrow.TimestampType{Unit: arrow.Microsecond}
+			richSqlType = "RANGE<DATETIME>"
 		case bigquery.TimestampFieldType:
 			childType = arrow.FixedWidthTypes.Timestamp_us
+			richSqlType = "RANGE<TIMESTAMP>"
 		default:
 			return arrow.Field{}, adbc.Error{
 				Code: adbc.StatusNotImplemented,
@@ -1088,9 +1107,6 @@ func buildField(schema *bigquery.FieldSchema, level uint) (arrow.Field, error) {
 	case bigquery.IntervalFieldType:
 		field.Type = arrow.FixedWidthTypes.MonthDayNanoInterval
 	default:
-		// TODO: unsupported ones are:
-		// - bigquery.IntervalFieldType
-		// - bigquery.RangeFieldType
 		return arrow.Field{}, adbc.Error{
 			Code: adbc.StatusInvalidArgument,
 			Msg:  fmt.Sprintf("Google SQL type `%s` is not supported yet", schema.Type),

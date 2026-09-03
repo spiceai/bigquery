@@ -30,7 +30,7 @@ def test_application_default_credentials_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.app_default_credentials"
+        assert auth_type == "app_default_credentials"
 
         project_id = db.get_option("adbc.bigquery.sql.project_id")
         assert project_id == "dummyproject"
@@ -47,7 +47,7 @@ def test_service_account_file_uri_parsing(
 ) -> None:
     """Test that service account JSON file URI is parsed correctly."""
     credentials_path = "/path/to/service-account.json"
-    uri = f"bigquery:///dummyproject?OAuthType=1&AuthCredentials={credentials_path}&DatasetId=dummydataset&TableId=mytable"
+    uri = f"bigquery:///dummyproject?OAuthType=1&AuthCredentials={credentials_path}&DatasetId=dummydataset"
 
     params = {
         "uri": uri,
@@ -55,7 +55,7 @@ def test_service_account_file_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.json_credential_file"
+        assert auth_type == "json_credential_file"
 
         computed_credentials = db.get_option("adbc.bigquery.sql.auth_credentials")
         assert computed_credentials == credentials_path
@@ -65,9 +65,6 @@ def test_service_account_file_uri_parsing(
 
         dataset_id = db.get_option("adbc.bigquery.sql.dataset_id")
         assert dataset_id == "dummydataset"
-
-        table_id = db.get_option("adbc.bigquery.sql.table_id")
-        assert table_id == "mytable"
 
 
 def test_service_account_string_uri_parsing(
@@ -84,7 +81,7 @@ def test_service_account_string_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.json_credential_string"
+        assert auth_type == "json_credential_string"
 
         computed_credentials = db.get_option("adbc.bigquery.sql.auth_credentials")
         assert computed_credentials == json_credentials
@@ -114,7 +111,7 @@ def test_user_oauth_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.user_authentication"
+        assert auth_type == "user_authentication"
 
         endpoint = db.get_option("adbc.bigquery.sql.endpoint")
         assert endpoint == "bigquery.googleapis.com:443"
@@ -150,7 +147,7 @@ def test_custom_endpoint_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.app_default_credentials"
+        assert auth_type == "app_default_credentials"
 
         endpoint = db.get_option("adbc.bigquery.sql.endpoint")
         assert endpoint == "bigquery.dummyapis.com:445"
@@ -177,7 +174,7 @@ def test_custom_endpoint_without_port_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.app_default_credentials"
+        assert auth_type == "app_default_credentials"
 
         endpoint = db.get_option("adbc.bigquery.sql.endpoint")
         assert endpoint == "bigquery.dummyapis.com:443"
@@ -201,7 +198,7 @@ def test_port_without_host_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.app_default_credentials"
+        assert auth_type == "app_default_credentials"
 
         endpoint = db.get_option("adbc.bigquery.sql.endpoint")
         assert endpoint == "bigquery.googleapis.com:448"
@@ -239,7 +236,7 @@ def test_minimal_uri_parsing(
 
     with adbc_driver_manager.AdbcDatabase(driver=driver_path, **params) as db:
         auth_type = db.get_option("adbc.bigquery.sql.auth_type")
-        assert auth_type == "adbc.bigquery.sql.auth_type.app_default_credentials"
+        assert auth_type == "app_default_credentials"
 
         project_id = db.get_option("adbc.bigquery.sql.project_id")
         assert project_id == "dummyproject"
