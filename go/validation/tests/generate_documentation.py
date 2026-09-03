@@ -14,7 +14,7 @@
 import argparse
 from pathlib import Path
 
-import adbc_drivers_validation.generate_documentation as generate_documentation
+from adbc_drivers_validation import generate_documentation
 
 from . import bigquery
 
@@ -28,7 +28,11 @@ if __name__ == "__main__":
 
     reports = [report.resolve() for report in Path(".").glob("validation-report*.xml")]
     generate_documentation.generate(
-        bigquery.get_quirks,
+        "bigquery",
+        lambda version, vendor: bigquery.get_quirks(version),
+        [
+            ("bigquery", "BigQuery"),
+        ],
         reports,
         template,
         args.output.resolve(),
