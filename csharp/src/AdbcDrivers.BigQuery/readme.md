@@ -45,6 +45,50 @@ The ADBC driver passes the configured credentials to BigQuery, but you may need 
 
 ## Parameters
 
+### SQL query parameters
+
+`Bind` and `BindStream` support a single row of positional query parameters for
+GoogleSQL `?` placeholders. The bindings are used by both query-submission paths
+and by non-ingest `ExecuteUpdate`. Rebinding replaces the previous values.
+If stream materialization fails, subsequent executions retain that failure until
+`Bind` or `BindStream` supplies a new binding; the remaining rows are never retried
+as a different parameter set.
+Bindings are serialized separately from SQL; callers must not quote or escape
+parameter values as SQL literals. Legacy SQL is rejected when parameters are bound.
+
+Supported Arrow scalar types are boolean, signed integers, unsigned integers
+within INT64 range, float/double, UTF-8 text, binary, date, time, timestamp, and
+decimal128/256 within BigQuery NUMERIC/BIGNUMERIC precision and scale limits.
+Null values retain their Arrow types. Temporal values must fit BigQuery's
+microsecond precision; finer nonzero fractions are rejected rather than truncated.
+Unzoned timestamps map to DATETIME and zoned timestamps map to TIMESTAMP.
+The Arrow timestamp-with-offset extension also maps to TIMESTAMP, preserving
+the UTC instant rather than interpreting the local clock as UTC.
+Duration/interval, nested types, named parameters, and multiple parameter rows
+are not supported by this query-binding implementation. Bulk ingestion retains
+its existing batch/stream behavior.
+
+For durations represented exactly in Int64 microseconds, callers can explicitly
+bind the count and construct an interval in GoogleSQL with
+`JUSTIFY_INTERVAL(INTERVAL ? MICROSECOND)` instead of binding an Arrow duration.
+
+#### Live validation
+
+`QueryParameterLiveTests` uses the existing `BIGQUERY_TEST_CONFIG_FILE` credential
+configuration to validate both query-submission APIs directly against BigQuery.
+The tests run constant SELECTs without creating datasets or tables, and check
+scalar types, Unicode/control characters, typed nulls, exact Int64 values, and
+rebinding on the same statement. They are skipped when no test configuration
+is supplied.
+
+From the `csharp` directory:
+
+```powershell
+dotnet test .\test\AdbcDrivers.BigQuery.Tests\AdbcDrivers.BigQuery.Tests.csproj --framework net8.0 --filter "FullyQualifiedName~QueryParameterLiveTests"
+```
+
+### Driver configuration
+
 The following parameters can be used to configure the driver behavior. The parameters are case sensitive.
 
 **adbc.bigquery.access_token**<br>
@@ -52,6 +96,9 @@ The following parameters can be used to configure the driver behavior. The param
 
 **adbc.bigquery.audience_uri**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Sets the audience URI for the authentication token. Currently, this is for Microsoft Entra, but this could be used for other OAuth implementations as well.
+
+**adbc.bigquery.service_account_impersonation_email**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google service account to impersonate after the token exchange, so queries run as that account rather than as the federated caller. Only applies when `adbc.bigquery.auth_type` is `aad`; it is ignored for `user` and `service`. When omitted, the federated token is used directly. The impersonated token is requested for the scopes in `adbc.bigquery.scopes`, defaulting to `https://www.googleapis.com/auth/cloud-platform`. See [Microsoft Entra](#microsoft-entra) for the workload identity prerequisites.
 
 **adbc.bigquery.allow_large_results**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Sets the [AllowLargeResults](https://cloud.google.com/dotnet/docs/reference/Google.Cloud.BigQuery.V2/latest/Google.Cloud.BigQuery.V2.QueryOptions#Google_Cloud_BigQuery_V2_QueryOptions_AllowLargeResults) value of the QueryOptions to `true` if configured; otherwise, the default is `false`.
@@ -98,11 +145,25 @@ The following parameters can be used to configure the driver behavior. The param
 **adbc.bigquery.max_fetch_concurrency**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. Sets the [maxStreamCount](https://cloud.google.com/dotnet/docs/reference/Google.Cloud.BigQuery.Storage.V1/latest/Google.Cloud.BigQuery.Storage.V1.BigQueryReadClient#Google_Cloud_BigQuery_Storage_V1_BigQueryReadClient_CreateReadSession_System_String_Google_Cloud_BigQuery_Storage_V1_ReadSession_System_Int32_Google_Api_Gax_Grpc_CallSettings_) for the CreateReadSession method. If not set, defaults to 1.
 
+**adbc.bigquery.ingest.max_in_flight_batches**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional **statement** option used by bulk ingestion. A positive integer limiting the number of unacknowledged append requests on one pending write stream; defaults to `4`. Use `1` for sequential appends. One sender writes requests in order while one reader checks responses concurrently. Input reading pauses when the window is full. Each Arrow batch remains one request, so this bounds request count rather than bytes; memory usage depends on batch size. All responses and the final RPC status must succeed before finalization and atomic commit. This option does not create multiple streams or introduce automatic append retries.
+
+**adbc.bigquery.ingest.grpc_compression**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional **statement** option used by bulk ingestion. Accepts `gzip` (default) or `none`. Requests gRPC transport compression for append messages in either upload format. Compression trades CPU for reduced network traffic; the performance benefit depends on the data and environment. Set to `none` to disable compression. Unsupported compression fails without falling back to uncompressed appends.
+
+**adbc.bigquery.ingest.format**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional **statement** option used by bulk ingestion. Accepts `protobuf` (default) or `arrow`. Both accept Arrow record batches and streams through the same bulk ingestion API. Protobuf converts batches into rows and uses BigQuery's `column_name` annotations to preserve flexible column names, including spaces, at every nesting level. Arrow sends Arrow IPC directly, but the Storage Write API rejects some flexible column names in this format. Set this option before `ExecuteUpdate`, for example `statement.SetOption(BigQueryParameters.IngestFormat, "arrow")`. Both formats use the same pipelining, compression, and atomic commit behavior; there is no automatic fallback between them.
+
+Protobuf ingestion supports signed and unsigned integers (within BigQuery's signed INT64 range), booleans, floats, doubles, strings, binary and fixed-size binary, Decimal128/NUMERIC and Decimal256/BIGNUMERIC, Date32/Date64, times and timestamps in all Arrow time units, structs, and lists of supported non-list types. Decimal values retain their full precision. Temporal values are truncated to microseconds. Protobuf converts NULL lists to empty lists; BigQuery's Arrow write path rejects NULL lists. NULL list elements and directly nested lists are not supported. Unsupported types fail before table creation or replacement.
+
 **adbc.bigquery.multiple_statement.statement_type**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. When executing multiple statements, limit the type of statement returned. If not set, all types of statements are returned.
 
 **adbc.bigquery.multiple_statement.statement_index**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. When executing multiple statements, specify the result of the statement to be returned (Minimum value is 1). If not set, the result of the first statement is returned.
+
+**adbc.bigquery.multiple_statement.use_last_statement**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. When set to `"true"`, returns the last statement matching the statement type and evaluation kind filters. Defaults to `"false"`. When enabled, this option takes precedence over `adbc.bigquery.multiple_statement.statement_index`.
 
 **adbc.bigquery.multiple_statement.evaluation_kind**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. When executing multiple statements, limit the evaluation kind returned. If not set, all evaluation kinds are returned.
@@ -125,15 +186,26 @@ The following parameters can be used to configure the driver behavior. The param
 **adbc.bigquery.refresh_token**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;The refresh token used for when the generated OAuth token expires. Required for `user` authentication.
 
+**adbc.bigquery.statement.use_job_creation_required_mode**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. When set to `true`, executes queries through the BigQuery `jobs.query` endpoint with `jobCreationMode` set to `JOB_CREATION_REQUIRED`. Complete eligible results returned inline are converted directly to Arrow; paged, incomplete, unsupported, or larger results fall back to the standard job-results and Storage Read API path. Defaults to `false`.
+
 **adbc.bigquery.retry_delay_ms**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional The delay between retries. Defaults to 200ms. The retries could take up to `adbc.bigquery.maximum_retries` x `adbc.bigquery.retry_delay_ms` to complete.
 
 **adbc.bigquery.scopes**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. Comma separated list of scopes to include for the credential.
 
+**adbc.bigquery.universe_domain**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google Cloud universe domain to connect to, for example `s3nsapis.fr` for [S3NS](https://www.s3ns.io/). The BigQuery, BigQuery Storage and Security Token Service hosts are derived from it (see [Endpoints to allow](#endpoints-to-allow)); IAM Credentials stays on `iamcredentials.googleapis.com` in every universe. Must be a bare domain name, without scheme, port or path. Defaults to `googleapis.com`. Because credentials are sent to hosts under this domain, only the known universes `googleapis.com`, `googleapis.de` and `s3nsapis.fr` are accepted unless `adbc.bigquery.allow_unknown_universe_domain` is set. Credentials built from an access token (`aad`) are bound to this universe; `service` JSON credentials must have been issued for it, which they record in their `universe_domain` field. `user` authentication always uses `accounts.google.com` and is only supported in the default universe.
+
+**adbc.bigquery.allow_unknown_universe_domain**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. Set to `true` to accept an `adbc.bigquery.universe_domain` that is not a known universe. Defaults to `false`. Applications that let end users supply connection parameters should not pass this one through, so that credentials cannot be redirected to an arbitrary domain.
+
 **adbc.bigquery.use_legacy_sql**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Sets the [UseLegacySql](https://cloud.google.com/dotnet/docs/reference/Google.Cloud.BigQuery.V2/latest/Google.Cloud.BigQuery.V2.QueryOptions#Google_Cloud_BigQuery_V2_QueryOptions_UseLegacySql) value of the QueryOptions to `true` if configured; otherwise, the default is `false`.
 
+**adbc.bigquery.custom_user_agent**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. A string identifying the calling application that is appended to the driver's `User-Agent` header, useful for attributing BigQuery traffic to a specific tool or integration.
 
 ## Type Support
 
@@ -177,6 +249,35 @@ connection.UpdateToken = () => Task.Run(() =>
 
 In the sample above, when a new token is needed, the delegate is invoked and updates the `adbc.bigquery.access_token` parameter on the connection object.
 
+### Service account impersonation
+
+Set `adbc.bigquery.service_account_impersonation_email` to run queries as a shared Google service account instead of as the federated caller. The driver exchanges the Entra token at the Google Security Token Service, then calls [generateAccessToken](https://cloud.google.com/iam/docs/reference/credentials/rest/v1/projects.serviceAccounts/generateAccessToken) to obtain a token for that service account.
+
+This requires:
+
+- `adbc.bigquery.audience_uri` set to a [workload identity pool](https://cloud.google.com/iam/docs/workload-identity-federation) provider, in the form `//iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/providers/PROVIDER_ID`.
+- The provider configured to accept the Entra application as an audience, with its issuer set to the tenant and an attribute mapping that populates `google.subject`.
+- The target service account granting `roles/iam.workloadIdentityUser` to the workload-pool principal whose subject matches the mapped `google.subject`, for example `principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/subject/SUBJECT_VALUE`. To grant access to a set of callers instead, map a custom attribute on the provider and use its `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.NAME/VALUE` identifier.
+- The service account holding whatever BigQuery roles the queries need, since they now run under its identity.
+
+Scopes come from `adbc.bigquery.scopes` when set, and each comma-separated entry is sent as a separate scope. When it is not set, `https://www.googleapis.com/auth/cloud-platform` is used.
+
+#### Which identity needs which permission
+
+Two identities are involved, and they need different things. The Entra caller needs the service account impersonation grant described below, but it does not need the BigQuery roles used by queries. The service account needs every permission the queries actually use, because they run under its identity.
+
+| Identity | Needs |
+| --- | --- |
+| Entra caller | A token from the tenant named as the provider's `issuerUri`, with an audience listed in the provider's allowed audiences. In Entra this means the application exposes a scope and the caller has consent for it. |
+| Entra caller | `roles/iam.workloadIdentityUser` on the target service account, granted to the workload-pool principal matching the mapped `google.subject`. `roles/iam.serviceAccountTokenCreator` also works, as it likewise grants `iam.serviceAccounts.getAccessToken`. |
+| Service account | `roles/bigquery.jobUser` on the project that bills the query, which is `adbc.bigquery.billing_project_id` when set. |
+| Service account | `roles/bigquery.dataViewer` on the data being read, granted at project, dataset or table level. |
+| Service account | `roles/bigquery.readSessionUser`, required because the driver reads results through the BigQuery Storage Read API. |
+
+The project must also have the IAM Service Account Credentials API (`iamcredentials.googleapis.com`) and the Security Token Service API (`sts.googleapis.com`) enabled, in addition to the BigQuery API.
+
+Both the token exchange and the impersonation call are traced. See [Tracing](#tracing) for the `wif.sts_exchange.*` and `wif.sa_impersonation.*` tags, which record the endpoint, status code, duration and Google correlation id for each step.
+
 ## Default Project ID
 
 If a `adbc.bigquery.project_id` is not specified, or if it equals `bigquery-public-data`, the driver will query for the first project ID that is associated with the credentials provided. This will be the project ID that is used to perform queries.
@@ -192,6 +293,38 @@ Behavior:
 - If only a dataset value is set, the driver will attempt to retrieve the dataset. If the dataset does not exist, the driver will attempt to
   create it. The default table expiration will be set to 1 day. A randomly generated name will be used for the table name.
 - If a destination table and a dataset are not specified, the driver will attempt to use or create the `_bqadbc_temp_tables` dataset using the same defaults and label specified above. A randomly generated name will be used for the table name.
+
+## Proxy
+
+The driver routes its HTTP traffic through a forward proxy when `adbc.bigquery.proxy_host` and `adbc.bigquery.proxy_port` are set, including the Microsoft Entra token exchange and service account impersonation calls. When those parameters are not set, the platform default proxy applies: system settings on .NET Framework, and the `HTTPS_PROXY` and `NO_PROXY` environment variables on .NET.
+
+### Endpoints to allow
+
+Environments that allow outbound hosts explicitly need all of the following reachable. The first three are contacted directly by the driver; the last two are used by the Google client libraries it builds on.
+
+The hosts below are for the default universe. When `adbc.bigquery.universe_domain` is set, `googleapis.com` is replaced by that domain for `sts`, `bigquery` and `bigquerystorage`, for example `sts.s3nsapis.fr`, `bigquery.s3nsapis.fr` and `bigquerystorage.s3nsapis.fr` for S3NS. IAM Credentials is not universe-specific: impersonation still calls `iamcredentials.googleapis.com`, so that host must remain reachable in other universes too.
+
+Note that `https://www.googleapis.com/auth/cloud-platform`, the default value of `adbc.bigquery.scopes`, is an OAuth scope identifier rather than a host the driver connects to. It does not need to be allowed.
+
+| Host | Used for |
+| --- | --- |
+| `sts.googleapis.com` | Security Token Service exchange, `aad` authentication only |
+| `iamcredentials.googleapis.com` | `generateAccessToken`, only when `adbc.bigquery.service_account_impersonation_email` is set |
+| `accounts.google.com` | OAuth token endpoint for `user` authentication |
+| `bigquery.googleapis.com` | BigQuery REST API: jobs, metadata and query submission |
+| `bigquerystorage.googleapis.com` | BigQuery Storage APIs: the Read API for result rows and the Write API for bulk ingestion |
+
+`iamcredentials.googleapis.com` is new to service account impersonation. An allow list that already covers the Entra flow will not include it, and the failure appears only after federation has already succeeded.
+
+### SSL inspection and the Storage APIs
+
+`bigquerystorage.googleapis.com` is reached over gRPC, which requires HTTP/2. Proxies that terminate TLS must negotiate ALPN `h2` for that host or the connection is downgraded, and the driver reports:
+
+    Bad gRPC response. Response protocol downgraded to HTTP/1.1.
+
+That message comes from the gRPC client before it inspects the status code, so a proxy block page or a `407 Proxy Authentication Required` surfaces with the same text. Exempting the host from TLS inspection avoids it. The other hosts in the table are plain HTTPS and are unaffected.
+
+On .NET Framework the two legs resolve proxy settings from different places: REST calls follow `WebRequest.DefaultWebProxy`, which reads the system settings, while gRPC uses `WinHttpHandler`, which reads the WinHTTP configuration set by `netsh winhttp`. The two can disagree, so a stale `netsh winhttp` proxy will break result reads while metadata and navigation keep working. `netsh winhttp show proxy` is worth checking when that pattern appears.
 
 ## Permissions
 

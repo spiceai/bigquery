@@ -39,6 +39,11 @@ namespace AdbcDrivers.BigQuery
         public const string ClientId = "adbc.bigquery.client_id";
         public const string ClientSecret = "adbc.bigquery.client_secret";
         public const string ClientTimeout = "adbc.bigquery.client.timeout";
+
+        /// <summary>
+        /// Optional Google service account to impersonate after the Security Token Service exchange.
+        /// </summary>
+        public const string ServiceAccountImpersonationEmail = "adbc.bigquery.service_account_impersonation_email";
         public const string EvaluationKind = "adbc.bigquery.multiple_statement.evaluation_kind";
         public const string GetQueryResultsOptionsTimeout = "adbc.bigquery.get_query_results_options.timeout";
         public const string IncludeConstraintsWithGetObjects = "adbc.bigquery.include_constraints_getobjects";
@@ -52,6 +57,9 @@ namespace AdbcDrivers.BigQuery
         public const string DefaultClientLocation = "adbc.bigquery.default_client_location";
         public const string LargeResultsDestinationTable = "adbc.bigquery.large_results_destination_table";
         public const string MaxFetchConcurrency = "adbc.bigquery.max_fetch_concurrency";
+        public const string IngestMaxInFlightBatches = "adbc.bigquery.ingest.max_in_flight_batches";
+        public const string IngestGrpcCompression = "adbc.bigquery.ingest.grpc_compression";
+        public const string IngestFormat = "adbc.bigquery.ingest.format";
         public const string MaximumRetryAttempts = "adbc.bigquery.maximum_retries";
         public const string ProjectId = "adbc.bigquery.project_id";
         public const string ProxyHost = "adbc.bigquery.proxy_host";
@@ -64,8 +72,24 @@ namespace AdbcDrivers.BigQuery
         public const string Scopes = "adbc.bigquery.scopes";
         public const string StatementIndex = "adbc.bigquery.multiple_statement.statement_index";
         public const string StatementType = "adbc.bigquery.multiple_statement.statement_type";
+        public const string UseLastStatement = "adbc.bigquery.multiple_statement.use_last_statement";
         public const string UseLegacySQL = "adbc.bigquery.use_legacy_sql";
+
+        /// <summary>
+        /// The Google Cloud universe domain to connect to (e.g. "s3nsapis.fr" for S3NS).
+        /// The BigQuery, BigQuery Storage and Security Token Service endpoints are derived from it.
+        /// Defaults to "googleapis.com". Only the domains in <see cref="BigQueryConstants.KnownUniverseDomains"/>
+        /// are accepted unless <see cref="AllowUnknownUniverseDomain"/> is set.
+        /// </summary>
+        public const string UniverseDomain = "adbc.bigquery.universe_domain";
+
+        /// <summary>
+        /// Set to "true" to accept a <see cref="UniverseDomain"/> that is not a known universe.
+        /// </summary>
+        public const string AllowUnknownUniverseDomain = "adbc.bigquery.allow_unknown_universe_domain";
         public const string IsMetadataCommand = "adbc.bigquery.statement.is_metadata_command";
+        public const string UseJobCreationMode = "adbc.bigquery.statement.use_job_creation_required_mode";
+        public const string CustomUserAgent = "adbc.bigquery.custom_user_agent";
 
         /// <summary>
         /// Overrides the BigQuery REST API endpoint for testing (e.g. "localhost:1234").
@@ -88,11 +112,11 @@ namespace AdbcDrivers.BigQuery
         // these values are safe to log any time
         private static HashSet<string> safeToLog = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            AllowLargeResults, AuthenticationType, BillingProjectId, ClientId, ClientTimeout, DefaultClientLocation, EvaluationKind, GetQueryResultsOptionsTimeout,
+            AllowLargeResults, AuthenticationType, BillingProjectId, ClientId, ClientTimeout, CustomUserAgent, DefaultClientLocation, EvaluationKind, GetQueryResultsOptionsTimeout,
             EvaluationKind, GetQueryResultsOptionsTimeout, IncludeConstraintsWithGetObjects,
             IncludePublicProjectId, LargeDecimalsAsString, CreateLargeResultsDataset, LargeResultsDataset, LargeResultsDestinationTable,
-            MaxFetchConcurrency, MaximumRetryAttempts, ProjectId, RetryDelayMs, StatementIndex,
-            StatementType, UseLegacySQL
+            MaxFetchConcurrency, IngestMaxInFlightBatches, IngestGrpcCompression, IngestFormat, MaximumRetryAttempts, UseJobCreationMode, ProjectId, RetryDelayMs, StatementIndex,
+            StatementType, UniverseDomain, AllowUnknownUniverseDomain, UseLastStatement, UseLegacySQL
         };
 
         public static bool IsSafeToLog(string name)
@@ -109,6 +133,10 @@ namespace AdbcDrivers.BigQuery
     /// </summary>
     internal class BigQueryConstants
     {
+        public const int DefaultIngestMaxInFlightBatches = 4;
+        public const string GzipCompression = "gzip";
+        public const string DefaultIngestGrpcCompression = GzipCompression;
+        public const string DefaultIngestFormat = "protobuf";
         public const string UserAuthenticationType = "user";
         public const string EntraIdAuthenticationType = "aad";
         public const string ServiceAccountAuthenticationType = "service";
@@ -118,10 +146,40 @@ namespace AdbcDrivers.BigQuery
 
         // Entra ID / Azure AD constants
         public const string EntraGrantType = "urn:ietf:params:oauth:grant-type:token-exchange";
-        public const string EntraSubjectTokenType = "urn:ietf:params:oauth:token-type:id_token";
         public const string EntraRequestedTokenType = "urn:ietf:params:oauth:token-type:access_token";
         public const string EntraIdScope = "https://www.googleapis.com/auth/cloud-platform";
-        public const string EntraStsTokenEndpoint = "https://sts.googleapis.com/v1/token";
+
+        // Universe domain constants
+
+        /// <summary>
+        /// The universe domain of the public Google Cloud. Other universes (e.g. S3NS, "s3nsapis.fr")
+        /// expose the same services under their own domain.
+        /// </summary>
+        public const string DefaultUniverseDomain = "googleapis.com";
+
+        /// <summary>
+        /// The universe domains accepted without <see cref="BigQueryParameters.AllowUnknownUniverseDomain"/>.
+        /// </summary>
+        public static readonly IReadOnlyList<string> KnownUniverseDomains = new[] { DefaultUniverseDomain, "s3nsapis.fr", "googleapis.de" };
+
+        /// <summary>
+        /// The Security Token Service endpoint; {0} is the universe domain.
+        /// </summary>
+        public const string StsTokenEndpointFormat = "https://sts.{0}/v1/token";
+
+        // Workload Identity Federation constants
+
+        /// <summary>
+        /// Google requires OIDC/JWT subject tokens from Azure to be presented as a generic JWT.
+        /// See https://cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds.
+        /// </summary>
+        public const string AzureSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt";
+
+        /// <summary>
+        /// The IAM Credentials generateAccessToken endpoint; {0} is the escaped service account email.
+        /// IAM Credentials stays on googleapis.com in every universe, including S3NS.
+        /// </summary>
+        public const string ServiceAccountImpersonationUrlFormat = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{0}:generateAccessToken";
 
         // default value per https://pkg.go.dev/cloud.google.com/go/bigquery#section-readme
         public const string DetectProjectId = "*detect-project-id*";
