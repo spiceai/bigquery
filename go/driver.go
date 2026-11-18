@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"strings"
 
 	"cloud.google.com/go/bigquery"
@@ -92,6 +93,17 @@ const (
 	OptionQueryCreateSession           = "bigquery.query.create_session"
 	OptionQueryJobTimeout              = "bigquery.query.job_timeout"
 
+	OptionQueryJobCreationMode = "bigquery.query.job_creation_mode"
+	JobCreationModeRequired    = "required"
+	JobCreationModeOptional    = "optional"
+
+	OptionQueryResultsFormat                              = "bigquery.query.results_format"
+	ResultsFormatArrow                                    = "arrow"
+	ResultsFormatStructEncoding                           = "struct_encoding"
+	OptionQueryArrowSerializationOptionsBufferCompression = "bigquery.query.arrow_serialization_options.buffer_compression"
+	ResultsCompressionLz4                                 = "lz4"
+	ResultsCompressionZstd                                = "zstd"
+
 	OptionQueryResultBufferSize    = "bigquery.query.result_buffer_size"
 	OptionQueryPrefetchConcurrency = "bigquery.query.prefetch_concurrency"
 
@@ -130,6 +142,8 @@ const (
 	OptionValueCompressionNone  = "none"
 	OptionValueCompressionLZ4   = "lz4"
 	OptionValueCompressionZSTD  = "zstd"
+
+	OptionCustomUserAgent = "bigquery.user_agent"
 )
 
 var (
@@ -228,6 +242,7 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 	db := &databaseImpl{
 		DatabaseImplBase: dbBase,
 		authType:         OptionValueAuthTypeDefault,
+		queryDefaults:    newQueryDefaults(),
 	}
 	if err := db.SetOptions(ctx, opts); err != nil {
 		return nil, err
@@ -238,6 +253,12 @@ func (d *driverImpl) NewDatabaseWithContext(ctx context.Context, opts map[string
 
 func stringToTable(defaultProjectID, defaultDatasetID, value string) (*bigquery.Table, error) {
 	parts := strings.Split(value, ".")
+	if slices.Contains(parts, "") {
+		return nil, adbc.Error{
+			Code: adbc.StatusInvalidArgument,
+			Msg:  fmt.Sprintf("[bq] invalid table reference format, expected `[[ProjectId.][Catalog.]DatasetId.]TableId`, got: `%s`", value),
+		}
+	}
 	table := &bigquery.Table{
 		ProjectID: defaultProjectID,
 		DatasetID: defaultDatasetID,
@@ -252,10 +273,14 @@ func stringToTable(defaultProjectID, defaultDatasetID, value string) (*bigquery.
 		table.ProjectID = parts[0]
 		table.DatasetID = parts[1]
 		table.TableID = parts[2]
+	case 4:
+		table.ProjectID = parts[0]
+		table.DatasetID = parts[1] + "." + parts[2]
+		table.TableID = parts[3]
 	default:
 		return nil, adbc.Error{
 			Code: adbc.StatusInvalidArgument,
-			Msg:  fmt.Sprintf("[bq] invalid table reference format, expected `[[ProjectId.]DatasetId.]TableId`, got: `%s`", value),
+			Msg:  fmt.Sprintf("[bq] invalid table reference format, expected `[[ProjectId.][Catalog.]DatasetId.]TableId`, got: `%s`", value),
 		}
 	}
 	return table, nil
@@ -306,4 +331,16 @@ func tableToString(value *bigquery.Table) string {
 	} else {
 		return fmt.Sprintf("%s.%s.%s", value.ProjectID, value.DatasetID, value.TableID)
 	}
+}
+
+func stringToCustomUserAgent(value string) string {
+	version := driverbase.DriverVersion()
+	if version == "" || version == driverbase.UnknownVersion {
+		version = "unknown"
+	}
+	driverUserAgent := fmt.Sprintf("Google-BigQuery-ADBC-Go/%s", version)
+	if value != "" {
+		driverUserAgent = fmt.Sprintf("%s %s", driverUserAgent, value)
+	}
+	return driverUserAgent
 }

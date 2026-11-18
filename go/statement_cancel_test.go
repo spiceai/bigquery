@@ -352,10 +352,9 @@ func TestRunQueryUsesFreshGeneratedJobID(t *testing.T) {
 	configured := query.JobIDConfig
 	ids := make([]string, 2)
 	for i := range ids {
-		_, _, _, err = runQuery(context.Background(), quietLogger(), query, true, st)
+		_, _, ids[i], _, err = runQuery(context.Background(), quietLogger(), client, query, true, st)
 		require.NoError(t, err)
 		require.Equal(t, configured, query.JobIDConfig)
-		ids[i] = <-srv.accepted
 	}
 	require.NotEqual(t, ids[0], ids[1])
 }
