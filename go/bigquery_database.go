@@ -59,8 +59,12 @@ type databaseImpl struct {
 	endpoint        string
 	storageEndpoint string
 
+	queryDefaults queryDefaults
+
 	bulkIngestMethod      string
 	bulkIngestCompression string
+
+	customUserAgent string
 }
 
 func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, error) {
@@ -84,8 +88,10 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.ConnectionWithContext, er
 		resultRecordBufferSize:     defaultQueryResultBufferSize,
 		prefetchConcurrency:        defaultQueryPrefetchConcurrency,
 		quotaProject:               d.quotaProject,
+		queryDefaults:              d.queryDefaults,
 		bulkIngestMethod:           d.bulkIngestMethod,
 		bulkIngestCompression:      d.bulkIngestCompression,
+		customUserAgent:            d.customUserAgent,
 	}
 
 	err := conn.newClient(ctx)
@@ -105,6 +111,9 @@ func (d *databaseImpl) Close(ctx context.Context) error { return nil }
 
 func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error) {
 	key = remapOption(key)
+	if handled, value, err := d.queryDefaults.getOption(key); handled {
+		return value, err
+	}
 	switch key {
 	case OptionAuthType:
 		return d.authType, nil
@@ -149,6 +158,8 @@ func (d *databaseImpl) GetOption(ctx context.Context, key string) (string, error
 			return OptionValueCompressionNone, nil
 		}
 		return d.bulkIngestCompression, nil
+	case OptionCustomUserAgent:
+		return d.customUserAgent, nil
 	default:
 		return d.DatabaseImplBase.GetOption(ctx, key)
 	}
@@ -183,6 +194,9 @@ func (d *databaseImpl) hasImpersonationOptions() bool {
 
 func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) error {
 	key = remapOption(key)
+	if handled, err := d.queryDefaults.setOption(key, value); handled {
+		return err
+	}
 	switch key {
 	case "uri":
 		params, err := ParseBigQueryURIToParams(value)
@@ -243,9 +257,16 @@ func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) 
 	case OptionImpersonateTargetPrincipal:
 		d.impersonateTargetPrincipal = value
 	case OptionImpersonateDelegates:
-		d.impersonateDelegates = strings.Split(value, ",")
+		// Guard against strings.Split("", ",") yielding [""]. These values are
+		// copied into the connection by Open, so an unguarded split here would
+		// defeat the same guard on the connection side.
+		if value != "" {
+			d.impersonateDelegates = strings.Split(value, ",")
+		}
 	case OptionImpersonateScopes:
-		d.impersonateScopes = strings.Split(value, ",")
+		if value != "" {
+			d.impersonateScopes = strings.Split(value, ",")
+		}
 	case OptionImpersonateLifetime:
 		duration, err := time.ParseDuration(value)
 		if err != nil {
@@ -284,6 +305,8 @@ func (d *databaseImpl) SetOption(ctx context.Context, key string, value string) 
 			}
 		}
 		d.bulkIngestCompression = value
+	case OptionCustomUserAgent:
+		d.customUserAgent = value
 	default:
 		return d.DatabaseImplBase.SetOption(ctx, key, value)
 	}
@@ -299,7 +322,7 @@ func ParseBigQueryURIToParams(uri string) (map[string]string, error) {
 		}
 	}
 
-	parsedURI, err := url.Parse(uri)
+	parsedURI, err := driverbase.SafeParseURL(uri)
 	if err != nil {
 		return nil, adbc.Error{
 			Code: adbc.StatusInvalidArgument,

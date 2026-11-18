@@ -38,11 +38,15 @@ namespace AdbcDrivers.BigQuery
         BigQueryReadClient bigQueryReadClient;
         readonly string? endpoint;
         readonly ProxyConfiguration? proxyConfiguration;
+        readonly string? universeDomain;
+        readonly string? userAgent;
 
-        public TokenProtectedReadClientManger(GoogleCredential credential, string? testEndpoint = null, ProxyConfiguration? proxyConfiguration = null)
+        public TokenProtectedReadClientManger(GoogleCredential credential, string? testEndpoint = null, ProxyConfiguration? proxyConfiguration = null, string? universeDomain = null, string? userAgent = null)
         {
             this.endpoint = testEndpoint;
             this.proxyConfiguration = proxyConfiguration;
+            this.universeDomain = universeDomain;
+            this.userAgent = userAgent;
             UpdateCredential(credential);
 
             if (bigQueryReadClient == null)
@@ -62,6 +66,16 @@ namespace AdbcDrivers.BigQuery
 
             BigQueryReadClientBuilder readClientBuilder = new BigQueryReadClientBuilder();
 
+            if (!string.IsNullOrWhiteSpace(userAgent))
+            {
+                // Use CallSettings instead of readClientBuilder.UserAgent because GAX's
+                // GrpcNetClientAdapter ignores ClientBuilderBase.UserAgent (PrimaryUserAgent).
+                readClientBuilder.Settings = new BigQueryReadSettings
+                {
+                    CallSettings = CallSettings.FromHeader("user-agent", userAgent)
+                };
+            }
+
             GrpcAdapter? grpcAdapter = ProxyManager.CreateGrpcAdapter(proxyConfiguration);
             if (grpcAdapter != null)
             {
@@ -76,6 +90,12 @@ namespace AdbcDrivers.BigQuery
             else
             {
                 readClientBuilder.Credential = credential;
+
+                if (universeDomain != null)
+                {
+                    // Connects to bigquerystorage.{universe} instead of the googleapis.com default.
+                    readClientBuilder.UniverseDomain = universeDomain;
+                }
             }
 
             this.bigQueryReadClient = readClientBuilder.Build();

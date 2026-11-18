@@ -26,6 +26,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -66,6 +67,12 @@ namespace AdbcDrivers.BigQuery
 
         private readonly string infoDriverArrowVersion = BigQueryUtils.GetAssemblyVersion(typeof(IArrowArray));
 
+        // The universe domain is interpolated into service hostnames, so only accept a bare domain name.
+        private static readonly Regex UniverseDomainPattern = new Regex(
+            @"\A(?=.{1,253}\z)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+\z",
+            RegexOptions.CultureInvariant,
+            TimeSpan.FromMilliseconds(100));
+
         readonly AdbcInfoCode[] infoSupportedCodes = new[] {
             AdbcInfoCode.DriverName,
             AdbcInfoCode.DriverVersion,
@@ -88,6 +95,13 @@ namespace AdbcDrivers.BigQuery
 
             _proxyConfiguration = ProxyManager.CreateProxyConfiguration(this.properties);
             this.httpClient = ProxyManager.CreateHttpClient(_proxyConfiguration);
+
+            this.properties.TryGetValue(BigQueryParameters.CustomUserAgent, out string? customUserAgent);
+            DriverUserAgent = BigQueryUtils.GetDriverUserAgent(customUserAgent);
+            if (!this.httpClient.DefaultRequestHeaders.UserAgent.TryParseAdd(DriverUserAgent))
+            {
+                this.httpClient.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", DriverUserAgent);
+            }
 
             if (this.properties.TryGetValue(AdbcOptions.Telemetry.TraceParent, out string? traceParent) &&
                 !string.IsNullOrWhiteSpace(traceParent))
@@ -165,6 +179,26 @@ namespace AdbcDrivers.BigQuery
             {
                 TestStorageEndpoint = storageEndpoint;
             }
+
+            if (this.properties.TryGetValue(BigQueryParameters.UniverseDomain, out string? universeDomain) &&
+                !string.IsNullOrEmpty(universeDomain))
+            {
+                if (!UniverseDomainPattern.IsMatch(universeDomain))
+                {
+                    throw new ArgumentException($"The value '{universeDomain}' for parameter '{BigQueryParameters.UniverseDomain}' is not a valid domain name, such as 'googleapis.com' or 's3nsapis.fr'.");
+                }
+
+                // Credentials are sent to hosts under the universe domain, so a spoofed domain would
+                // capture them. Unknown domains have to be allowed explicitly by a second parameter.
+                if (!BigQueryConstants.KnownUniverseDomains.Contains(universeDomain, StringComparer.OrdinalIgnoreCase) &&
+                    !(this.properties.TryGetValue(BigQueryParameters.AllowUnknownUniverseDomain, out string? sAllowUnknown) &&
+                      bool.TryParse(sAllowUnknown, out bool allowUnknown) && allowUnknown))
+                {
+                    throw new ArgumentException($"The value '{universeDomain}' for parameter '{BigQueryParameters.UniverseDomain}' is not a known universe domain ({string.Join(", ", BigQueryConstants.KnownUniverseDomains)}). Set '{BigQueryParameters.AllowUnknownUniverseDomain}' to 'true' to use it anyway.");
+                }
+
+                UniverseDomain = universeDomain;
+            }
         }
 
         /// <summary>
@@ -217,7 +251,24 @@ namespace AdbcDrivers.BigQuery
 
         internal string? TestStorageEndpoint { get; private set; }
 
+        /// <summary>
+        /// The universe domain explicitly configured by the caller, or null to use the default.
+        /// </summary>
+        internal string? UniverseDomain { get; private set; }
+
+        internal string EffectiveUniverseDomain => UniverseDomain ?? BigQueryConstants.DefaultUniverseDomain;
+
+        /// <summary>
+        /// The Security Token Service endpoint of the effective universe, e.g. https://sts.s3nsapis.fr/v1/token.
+        /// </summary>
+        internal string StsTokenEndpoint => string.Format(
+            CultureInfo.InvariantCulture,
+            BigQueryConstants.StsTokenEndpointFormat,
+            EffectiveUniverseDomain);
+
         internal ProxyConfiguration? ProxyConfiguration => _proxyConfiguration;
+
+        internal string DriverUserAgent { get; private set; }
 
         internal string? ProjectId
         {
@@ -446,7 +497,8 @@ namespace AdbcDrivers.BigQuery
                 {
                     QuotaProject = billingProjectId,
                     GoogleCredential = modifiedCredential,
-                    HttpClientFactory = ProxyManager.CreateHttpClientFactory(_proxyConfiguration)
+                    HttpClientFactory = ProxyManager.CreateHttpClientFactory(_proxyConfiguration),
+                    ApplicationName = DriverUserAgent
                 };
 
                 bigQueryClientBuilder.ProjectId = !string.IsNullOrEmpty(billingProjectId) ? billingProjectId : projectId;
@@ -455,6 +507,13 @@ namespace AdbcDrivers.BigQuery
                     !string.IsNullOrEmpty(testRestEndpoint))
                 {
                     bigQueryClientBuilder.BaseUri = $"http://{testRestEndpoint}/bigquery/v2/";
+                }
+                else if (UniverseDomain != null)
+                {
+                    // Builds the base URI as https://bigquery.{universe}/ and requires the credential
+                    // to belong to the same universe (see SetCredential).
+                    bigQueryClientBuilder.UniverseDomain = UniverseDomain;
+                    activity?.AddBigQueryParameterTag(BigQueryParameters.UniverseDomain, UniverseDomain);
                 }
 
                 if (!string.IsNullOrEmpty(DefaultClientLocation))
@@ -544,7 +603,8 @@ namespace AdbcDrivers.BigQuery
                     if (!this.properties.TryGetValue(BigQueryParameters.AudienceUri, out audienceUri))
                         throw new ArgumentException($"The {BigQueryParameters.AudienceUri} parameter is not present");
 
-                    Credential = ApplyScopes(GoogleCredential.FromAccessToken(TradeEntraIdTokenForBigQueryToken(audienceUri, accessToken)));
+                    Credential = ApplyScopes(GoogleCredential.FromAccessToken(
+                        ImpersonateIfRequested(TradeEntraIdTokenForBigQueryToken(audienceUri, accessToken, activity), activity)));
                 }
                 else if (!string.IsNullOrEmpty(authenticationType) && authenticationType.Equals(BigQueryConstants.ServiceAccountAuthenticationType, StringComparison.OrdinalIgnoreCase))
                 {
@@ -557,11 +617,25 @@ namespace AdbcDrivers.BigQuery
                 }
                 else if (!string.IsNullOrEmpty(authenticationType) && authenticationType.Equals(BigQueryConstants.MockAuthenticationType, StringComparison.OrdinalIgnoreCase))
                 {
-                    Credential = ApplyScopes(GoogleCredential.FromAccessToken("mock-token"));
+                    // Tests can set an access token to observe which credentials a request used.
+                    if (!this.properties.TryGetValue(BigQueryParameters.AccessToken, out accessToken) || string.IsNullOrEmpty(accessToken))
+                    {
+                        accessToken = "mock-token";
+                    }
+                    Credential = ApplyScopes(GoogleCredential.FromAccessToken(accessToken));
                 }
                 else
                 {
                     throw new ArgumentException($"{authenticationType} is not a valid authenticationType");
+                }
+
+                // The client libraries reject a credential whose universe differs from the client's.
+                // Credentials built from an access token default to googleapis.com, so move them to the
+                // configured universe. JSON credentials issued for that universe already match.
+                if (UniverseDomain != null &&
+                    !string.Equals(Credential.GetUniverseDomain(), UniverseDomain, StringComparison.OrdinalIgnoreCase))
+                {
+                    Credential = Credential.CreateWithUniverseDomain(UniverseDomain);
                 }
 
                 Google.Apis.Http.HttpClientFactory? proxyHttpClientFactory = ProxyManager.CreateHttpClientFactory(_proxyConfiguration);
@@ -617,6 +691,32 @@ namespace AdbcDrivers.BigQuery
             }
 
             return credential;
+        }
+
+        /// <summary>
+        /// Applies service account impersonation to an already-federated token when the caller asked
+        /// for it, so BigQuery grants can live on a shared service account rather than each user.
+        /// </summary>
+        internal string? ImpersonateIfRequested(string? federatedToken, Activity? activity)
+        {
+            this.properties.TryGetValue(BigQueryParameters.ServiceAccountImpersonationEmail, out string? impersonationEmail);
+
+            // Deliberately IsNullOrEmpty: a whitespace value must reach validation, not opt out.
+            if (string.IsNullOrEmpty(impersonationEmail) || string.IsNullOrEmpty(federatedToken))
+            {
+                return federatedToken;
+            }
+
+            this.properties.TryGetValue(BigQueryParameters.Scopes, out string? scopes);
+
+            // generateAccessToken takes one array element per scope; joining them would be sent as
+            // a single malformed scope.
+            string[] scopeList = string.IsNullOrWhiteSpace(scopes)
+                ? new[] { BigQueryConstants.EntraIdScope }
+                : scopes!.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToArray();
+
+            return WorkloadIdentityFederation.ImpersonateServiceAccount(
+                this.httpClient, impersonationEmail!, scopeList, federatedToken!, activity);
         }
 
         public override IArrowArrayStream GetInfo(IReadOnlyList<AdbcInfoCode> codes)
@@ -921,7 +1021,7 @@ namespace AdbcDrivers.BigQuery
 
                 foreach (string projectId in projectIds)
                 {
-                    if (Regex.IsMatch(projectId, catalogRegexp, RegexOptions.IgnoreCase))
+                    if (Regex.IsMatch(projectId, catalogRegexp))
                     {
                         catalogNameBuilder.Append(projectId);
 
@@ -979,7 +1079,7 @@ namespace AdbcDrivers.BigQuery
                 {
                     foreach (BigQueryDataset schema in schemas)
                     {
-                        if (Regex.IsMatch(schema.Reference.DatasetId, dbSchemaRegexp, RegexOptions.IgnoreCase))
+                        if (Regex.IsMatch(schema.Reference.DatasetId, dbSchemaRegexp))
                         {
                             dbSchemaNameBuilder.Append(schema.Reference.DatasetId);
                             length++;
@@ -1032,27 +1132,34 @@ namespace AdbcDrivers.BigQuery
                 int length = 0;
 
                 string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLES",
-                    Sanitize(catalog), Sanitize(dbSchema));
+                    SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
+
+                List<BigQueryParameter> parameters = new List<BigQueryParameter>();
+                List<string> predicates = new List<string>();
 
                 if (tableNamePattern != null)
                 {
-                    query = string.Concat(query, string.Format(" WHERE table_name LIKE '{0}'", Sanitize(tableNamePattern)));
-                    if (tableTypes?.Count > 0)
-                    {
-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
-                        query = string.Concat(query, string.Format(" AND table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
-                    }
-                }
-                else
-                {
-                    if (tableTypes?.Count > 0)
-                    {
-                        IEnumerable<string> sanitizedTypes = tableTypes.Select(x => Sanitize(x));
-                        query = string.Concat(query, string.Format(" WHERE table_type IN ('{0}')", string.Join("', '", sanitizedTypes).ToUpper()));
-                    }
+                    predicates.Add("table_name LIKE @tableNamePattern");
+                    parameters.Add(new BigQueryParameter("tableNamePattern", BigQueryDbType.String, EscapeLikePattern(tableNamePattern)));
                 }
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                if (tableTypes?.Count > 0)
+                {
+                    // IN UNNEST rather than IN, because BigQuery does not expand a single array
+                    // parameter into an IN list.
+                    predicates.Add("table_type IN UNNEST(@tableTypes)");
+                    parameters.Add(new BigQueryParameter("tableTypes", BigQueryDbType.Array, tableTypes.Select(x => x.ToUpperInvariant()).ToList())
+                    {
+                        ArrayElementType = BigQueryDbType.String,
+                    });
+                }
+
+                if (predicates.Count > 0)
+                {
+                    query = string.Concat(query, " WHERE ", string.Join(" AND ", predicates));
+                }
+
+                BigQueryResults? result = ExecuteQuery(query, parameters);
 
                 if (result != null)
                 {
@@ -1138,15 +1245,21 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{2}'",
-                    Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
+                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName",
+                    SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
+
+                List<BigQueryParameter> parameters = new List<BigQueryParameter>
+                {
+                    new BigQueryParameter("tableName", BigQueryDbType.String, table),
+                };
 
                 if (columnNamePattern != null)
                 {
-                    query = string.Concat(query, string.Format("AND column_name LIKE '{0}'", Sanitize(columnNamePattern)));
+                    query = string.Concat(query, " AND column_name LIKE @columnNamePattern");
+                    parameters.Add(new BigQueryParameter("columnNamePattern", BigQueryDbType.String, EscapeLikePattern(columnNamePattern)));
                 }
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = ExecuteQuery(query, parameters);
 
                 if (result != null)
                 {
@@ -1240,10 +1353,13 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = '{2}'",
-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(table));
+                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.TABLE_CONSTRAINTS WHERE table_name = @tableName",
+                   SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = ExecuteQuery(query, new List<BigQueryParameter>
+                {
+                    new BigQueryParameter("tableName", BigQueryDbType.String, table),
+                });
 
                 if (result != null)
                 {
@@ -1304,12 +1420,16 @@ namespace AdbcDrivers.BigQuery
         {
             return this.TraceActivity(activity =>
             {
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = '{2}' AND constraint_name = '{3}' ORDER BY ordinal_position",
-               Sanitize(catalog), Sanitize(dbSchema), Sanitize(table), Sanitize(constraintName));
+                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.KEY_COLUMN_USAGE WHERE table_name = @tableName AND constraint_name = @constraintName ORDER BY ordinal_position",
+               SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
 
                 StringArray.Builder constraintColumnNamesBuilder = new StringArray.Builder();
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = ExecuteQuery(query, new List<BigQueryParameter>
+                {
+                    new BigQueryParameter("tableName", BigQueryDbType.String, table),
+                    new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName),
+                });
 
                 if (result != null)
                 {
@@ -1339,10 +1459,13 @@ namespace AdbcDrivers.BigQuery
                 ArrowBuffer.BitmapBuilder nullBitmapBuffer = new ArrowBuffer.BitmapBuilder();
                 int length = 0;
 
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = '{2}'",
-                   Sanitize(catalog), Sanitize(dbSchema), Sanitize(constraintName));
+                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name = @constraintName",
+                   SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = ExecuteQuery(query, new List<BigQueryParameter>
+                {
+                    new BigQueryParameter("constraintName", BigQueryDbType.String, constraintName),
+                });
 
                 if (result != null)
                 {
@@ -1380,15 +1503,42 @@ namespace AdbcDrivers.BigQuery
             }, ClassName + "." + nameof(GetConstraintsUsage));
         }
 
-        private string PatternToRegEx(string? pattern)
+        /// <summary>
+        /// Translates an ADBC search pattern into an equivalent regular expression, for the
+        /// catalog and dataset patterns that are matched client-side against listing results
+        /// rather than server-side by a SQL LIKE.
+        /// </summary>
+        /// <remarks>
+        /// Only "%" and "_" carry meaning in an ADBC search pattern; every other character is
+        /// literal, so each one is escaped rather than passed through to the regex engine. The
+        /// match is case-sensitive so that these patterns behave the same way as the table and
+        /// column patterns, which reach BigQuery as a case-sensitive LIKE.
+        /// </remarks>
+        internal static string PatternToRegEx(string? pattern)
         {
             if (pattern == null)
                 return ".*";
 
-            StringBuilder builder = new StringBuilder("(?i)^");
-            string convertedPattern = pattern.Replace("_", ".").Replace("%", ".*");
-            builder.Append(convertedPattern);
-            builder.Append("$");
+            StringBuilder builder = new StringBuilder(@"\A");
+
+            foreach (char c in pattern)
+            {
+                switch (c)
+                {
+                    case '_':
+                        builder.Append('.');
+                        break;
+                    case '%':
+                        builder.Append(".*");
+                        break;
+                    default:
+                        builder.Append(Regex.Escape(c.ToString()));
+                        break;
+                }
+            }
+
+            // \z rather than $, which in .NET also matches before a trailing newline.
+            builder.Append(@"\z");
 
             return builder.ToString();
         }
@@ -1479,10 +1629,13 @@ namespace AdbcDrivers.BigQuery
         {
             return this.TraceActivity(activity =>
             {
-                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = '{2}'",
-                Sanitize(catalog), Sanitize(dbSchema), Sanitize(tableName));
+                string query = string.Format("SELECT * FROM `{0}`.`{1}`.INFORMATION_SCHEMA.COLUMNS WHERE table_name = @tableName",
+                SanitizeIdentifier(catalog), SanitizeIdentifier(dbSchema));
 
-                BigQueryResults? result = ExecuteQuery(query, parameters: null);
+                BigQueryResults? result = ExecuteQuery(query, new List<BigQueryParameter>
+                {
+                    new BigQueryParameter("tableName", BigQueryDbType.String, tableName),
+                });
 
                 List<Field> fields = new List<Field>();
 
@@ -1560,10 +1713,11 @@ namespace AdbcDrivers.BigQuery
                     return fieldBuilder.DataType(StringType.Default);
                 case "BYTES":
                     return fieldBuilder.DataType(BinaryType.Default);
+                // Match BigQueryStatement.TranslateType: BigQuery returns both types in microseconds.
                 case "DATETIME":
-                    return fieldBuilder.DataType(TimestampType.Default);
+                    return fieldBuilder.DataType(new TimestampType(TimeUnit.Microsecond, (string?)null));
                 case "TIMESTAMP":
-                    return fieldBuilder.DataType(TimestampType.Default);
+                    return fieldBuilder.DataType(new TimestampType(TimeUnit.Microsecond, "UTC"));
                 case "TIME":
                     return fieldBuilder.DataType(Time64Type.Microsecond);
                 case "DATE":
@@ -1837,7 +1991,8 @@ namespace AdbcDrivers.BigQuery
                 BigQueryParameters.MaxFetchConcurrency,
                 BigQueryParameters.StatementType,
                 BigQueryParameters.StatementIndex,
-                BigQueryParameters.EvaluationKind
+                BigQueryParameters.EvaluationKind,
+                BigQueryParameters.UseLastStatement
             };
 
             foreach (string key in statementOptions)
@@ -1872,24 +2027,53 @@ namespace AdbcDrivers.BigQuery
             this._fileActivityListener?.Dispose();
         }
 
-        private static Regex sanitizedInputRegex = new Regex("^[a-zA-Z0-9_-]+");
+        /// <summary>
+        /// Matches a complete BigQuery project or dataset identifier. The character class is the
+        /// union of what BigQuery permits in each: a project id allows lowercase letters, digits
+        /// and hyphens, a dataset id allows letters, digits and underscores. Both anchors are
+        /// required - \A and \z rather than ^ and $, because .NET's $ also matches immediately
+        /// before a trailing newline.
+        /// </summary>
+        private static readonly Regex s_identifierRegex = new Regex(@"\A[a-zA-Z0-9_-]+\z", RegexOptions.CultureInvariant);
 
-        private string Sanitize(string? input)
+        /// <summary>
+        /// Validates a value that is interpolated into a query as a quoted identifier.
+        /// </summary>
+        /// <remarks>
+        /// BigQuery query parameters cannot stand in for identifiers, so the catalog and dataset
+        /// that name an INFORMATION_SCHEMA view have to be embedded in the query text. They are
+        /// therefore checked against the full set of characters BigQuery allows in those names;
+        /// anything else - a backtick that would close the identifier especially - is rejected.
+        /// Every other caller-supplied value is passed as a query parameter instead.
+        /// </remarks>
+        internal static string SanitizeIdentifier(string? input)
         {
             if (string.IsNullOrEmpty(input))
                 return string.Empty;
 
-            bool isValidInput = sanitizedInputRegex.IsMatch(input);
+            if (!s_identifierRegex.IsMatch(input))
+            {
+                // The rejected value is deliberately omitted: it failed validation precisely
+                // because it may contain characters - newlines and other control characters
+                // among them - that would let it forge or split log/error output if embedded.
+                throw new AdbcException("catalog or dataset identifier is invalid", AdbcStatusCode.InvalidArgument);
+            }
 
-            if (isValidInput)
-            {
-                return input!;
-            }
-            else
-            {
-                throw new AdbcException($"{input} is invalid", AdbcStatusCode.InvalidArgument);
-            }
+            return input!;
         }
+
+        /// <summary>
+        /// Escapes an ADBC search pattern so that BigQuery's LIKE operator gives it the meaning
+        /// the ADBC specification defines.
+        /// </summary>
+        /// <remarks>
+        /// An ADBC search pattern gives special meaning to "%" (zero or more characters) and "_"
+        /// (exactly one character) and nothing else - the specification states that escaping is
+        /// not supported. BigQuery's LIKE additionally treats "\" as an escape character, so a
+        /// backslash is doubled here to keep it literal. The two wildcards are deliberately left
+        /// alone so they still reach LIKE as wildcards.
+        /// </remarks>
+        internal static string EscapeLikePattern(string pattern) => pattern.Replace("\\", "\\\\");
 
         /// <summary>
         /// Gets the access token from the token endpoint.
@@ -1911,53 +2095,85 @@ namespace AdbcDrivers.BigQuery
             request.Headers.Add("Accept", "application/json");
             request.Content = new StringContent(body, Encoding.UTF8, "application/x-www-form-urlencoded");
             using HttpResponseMessage response = this.httpClient.SendAsync(request).GetAwaiter().GetResult();
-            response.EnsureSuccessStatusCode();
             string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+
+            // Google explains refusals (expired or revoked refresh tokens, for example) only in the
+            // body, so surface it instead of collapsing to a bare status code.
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new AdbcException(
+                    BuildTokenFailureMessage(response.StatusCode, responseBody),
+                    AdbcStatusCode.Unauthenticated);
+            }
 
             BigQueryTokenResponse? bigQueryTokenResponse = JsonSerializer.Deserialize<BigQueryTokenResponse>(responseBody);
 
             return bigQueryTokenResponse?.AccessToken;
         }
 
+        internal static string BuildTokenFailureMessage(HttpStatusCode statusCode, string? responseBody)
+        {
+            string detail = string.IsNullOrWhiteSpace(responseBody) ? "no response body" : responseBody!.Trim();
+            return $"The Google token endpoint returned {(int)statusCode} ({statusCode}): {detail}";
+        }
+
         /// <summary>
-        /// Gets the access token from the sts endpoint.
+        /// Exchanges the Entra token for a federated Google token at the Security Token Service.
         /// </summary>
-        /// <param name="audience"></param>
-        /// <param name="entraAccessToken"></param>
-        /// <returns></returns>
-        private string? TradeEntraIdTokenForBigQueryToken(string audience, string entraAccessToken)
+        private string? TradeEntraIdTokenForBigQueryToken(string audience, string entraAccessToken, Activity? activity)
         {
             try
             {
-                var requestBody = new
+                activity?.AddBigQueryTag(
+                    WorkloadIdentityFederation.TagPrefix + WorkloadIdentityFederation.StsExchangeStep + ".audience",
+                    audience);
+
+                string json = CreateEntraStsRequestBody(audience, entraAccessToken);
+
+                using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, StsTokenEndpoint)
                 {
-                    scope = BigQueryConstants.EntraIdScope,
-                    subjectToken = entraAccessToken,
-                    audience = audience,
-                    grantType = BigQueryConstants.EntraGrantType,
-                    subjectTokenType = BigQueryConstants.EntraSubjectTokenType,
-                    requestedTokenType = BigQueryConstants.EntraRequestedTokenType
+                    Content = new StringContent(json, Encoding.UTF8, "application/json")
                 };
 
-                string json = JsonSerializer.Serialize(requestBody);
-                using StringContent content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                using HttpResponseMessage response = this.httpClient.PostAsync(BigQueryConstants.EntraStsTokenEndpoint, content).GetAwaiter().GetResult();
-                response.EnsureSuccessStatusCode();
-
-                string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                string responseBody = WorkloadIdentityFederation.SendAsync(
+                    this.httpClient,
+                    request,
+                    WorkloadIdentityFederation.StsExchangeStep,
+                    "The Google Security Token Service",
+                    activity,
+                    default).GetAwaiter().GetResult();
 
                 BigQueryStsTokenResponse? bigQueryTokenResponse = JsonSerializer.Deserialize<BigQueryStsTokenResponse>(responseBody);
 
                 return bigQueryTokenResponse?.AccessToken;
             }
+            catch (AdbcException)
+            {
+                // SendAsync already reports the endpoint, status, error code and correlation id.
+                throw;
+            }
             catch (Exception ex)
             {
                 throw new AdbcException(
-                    "Unable to obtain access token from BigQuery",
+                    $"Unable to obtain access token from BigQuery. {ex.Message}",
                     AdbcStatusCode.Unauthenticated,
                     ex);
             }
+        }
+
+        internal static string CreateEntraStsRequestBody(string audience, string entraAccessToken)
+        {
+            var requestBody = new
+            {
+                scope = BigQueryConstants.EntraIdScope,
+                subjectToken = entraAccessToken,
+                audience = audience,
+                grantType = BigQueryConstants.EntraGrantType,
+                subjectTokenType = BigQueryConstants.AzureSubjectTokenType,
+                requestedTokenType = BigQueryConstants.EntraRequestedTokenType
+            };
+
+            return JsonSerializer.Serialize(requestBody);
         }
 
         enum XdbcDataType

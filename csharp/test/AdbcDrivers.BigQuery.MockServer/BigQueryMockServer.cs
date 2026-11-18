@@ -15,16 +15,23 @@
  */
 
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO.Compression;
+using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Google.Apis.Bigquery.v2.Data;
 using Google.Apis.Json;
+using Google.Apis.Requests;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Extensions.DependencyInjection;
@@ -39,14 +46,32 @@ namespace AdbcDrivers.BigQuery.MockServer
     /// </summary>
     public sealed class BigQueryMockServer : IDisposable
     {
+        /// <summary>The BigQuery job state for a job that has not started running.</summary>
+        public const string JobStatePending = "PENDING";
+
+        /// <summary>The BigQuery job state for a job that is executing.</summary>
+        public const string JobStateRunning = "RUNNING";
+
+        /// <summary>The BigQuery job state for a job that has finished, successfully or not.</summary>
+        public const string JobStateDone = "DONE";
+
         private readonly WebApplication _restApp;
         private readonly WebApplication _grpcApp;
         private readonly CancellationTokenSource _cts = new();
         private readonly ConcurrentDictionary<string, MockJob> _jobs = new();
         private readonly ConcurrentDictionary<string, Table> _tables = new();
         private readonly ConcurrentDictionary<string, bool> _sessions = new();
-        private readonly ConcurrentQueue<string> _executedQueries = new();
+        private readonly ConcurrentQueue<(string Query, IReadOnlyList<QueryParameter> Parameters)> _executedQueries = new();
+        private readonly List<string> _projects = new() { "mock-project" };
+        private readonly Dictionary<string, List<string>> _datasets =
+            new() { ["mock-project"] = new List<string> { "mock_dataset" } };
+        private readonly ConcurrentQueue<MockRequest> _requests = new();
+        private readonly ConcurrentDictionary<MockRequestKind, ConcurrentQueue<MockError>> _queuedErrors = new();
+        private IReadOnlyList<string> _jobStateScript = new[] { JobStateDone };
         private int _queryResultsRequestCount;
+        private int _requestSequence;
+        private int _lostInsertResponses;
+        private readonly AsyncLocal<string?> _requestAccessToken = new();
 
         /// <summary>
         /// The REST API endpoint as host:port (e.g., "127.0.0.1:12345").
@@ -63,12 +88,132 @@ namespace AdbcDrivers.BigQuery.MockServer
         /// <summary>
         /// Returns the list of SQL queries that were executed against this mock server, in order.
         /// </summary>
-        public IReadOnlyList<string> ExecutedQueries => _executedQueries.ToArray();
+        public IReadOnlyList<string> ExecutedQueries => _executedQueries.Select(e => e.Query).ToArray();
+
+        /// <summary>
+        /// The query parameters bound to each executed query, positionally aligned with
+        /// <see cref="ExecutedQueries"/>. A query that carried no parameters contributes an
+        /// empty list, so the two collections always have the same length.
+        /// </summary>
+        /// <remarks>
+        /// Both collections are projected from a single queue of (query, parameters) pairs, so a
+        /// query and its parameters are always recorded and read back together; recording them
+        /// via separate queues let concurrent requests interleave the two enqueues and desync
+        /// the pairing.
+        /// </remarks>
+        public IReadOnlyList<IReadOnlyList<QueryParameter>> ExecutedQueryParameters =>
+            _executedQueries.Select(e => e.Parameters).ToArray();
 
         /// <summary>
         /// The number of requests made to the query-results endpoint.
         /// </summary>
         public int QueryResultsRequestCount => _queryResultsRequestCount;
+
+        /// <summary>Whether jobs.query should create a job instead of returning results inline.</summary>
+        public bool OptionalQueryCreatesJob { get; set; }
+
+        /// <summary>Whether a created-job response should also contain complete inline results.</summary>
+        public bool OptionalQueryIncludesCompleteResults { get; set; }
+
+        /// <summary>Whether a created-job response should contain the first page and a continuation token.</summary>
+        public bool OptionalQueryIncludesPagedResults { get; set; }
+
+        /// <summary>The number of rows included in a complete jobs.query response.</summary>
+        public int OptionalQueryInlineRowCount { get; set; } = 1;
+
+        /// <summary>Overrides totalRows in a complete jobs.query response.</summary>
+        public ulong? OptionalQueryInlineTotalRows { get; set; }
+
+        /// <summary>The BigQuery field type returned in a complete created-job response.</summary>
+        public string OptionalQueryInlineFieldType { get; set; } = "INTEGER";
+
+        /// <summary>Overrides the inline jobs.query response when set.</summary>
+        public QueryResponse? InlineQueryResponse { get; set; }
+
+        /// <summary>The most recent jobs.query request.</summary>
+        public QueryRequest? LastQueryRequest { get; private set; }
+
+        /// <summary>The most recent jobs.insert request.</summary>
+        public Job? LastInsertedJob { get; private set; }
+
+        /// <summary>The most recent page token sent to jobs.getQueryResults.</summary>
+        public string? LastQueryResultsPageToken { get; private set; }
+
+        /// <summary>The total row count reported by jobs.getQueryResults.</summary>
+        public ulong QueryResultTotalRows { get; set; } = 1;
+
+        /// <summary>
+        /// Overrides the schema and rows returned by a completed jobs.getQueryResults when set, so a
+        /// test can serve the rows a metadata query (for example INFORMATION_SCHEMA.COLUMNS) reads.
+        /// </summary>
+        public TableSchema? QueryResultSchema { get; set; }
+
+        /// <summary>The rows returned with <see cref="QueryResultSchema"/>.</summary>
+        public IList<TableRow>? QueryResultRows { get; set; }
+
+        /// <summary>
+        /// The project ids returned by projects.list. Pre-populated with "mock-project".
+        /// </summary>
+        public IList<string> Projects => _projects;
+
+        /// <summary>
+        /// The dataset ids returned by datasets.list, keyed by project id. Pre-populated with
+        /// "mock_dataset" under "mock-project".
+        /// </summary>
+        public IDictionary<string, List<string>> Datasets => _datasets;
+
+        /// <summary>
+        /// Every REST request the server has handled, in arrival order.
+        /// </summary>
+        public IReadOnlyList<MockRequest> Requests => _requests.ToArray();
+
+        /// <summary>
+        /// Raised on the server thread as each request is recorded, before its response is produced.
+        /// Lets a test act (for example, cancel a statement) while the request is still in flight.
+        /// Handlers must not throw; an exception here surfaces to the driver as an HTTP 500.
+        /// </summary>
+        public event Action<MockRequest>? RequestReceived;
+
+        /// <summary>
+        /// The sequence of job states reported for successive status observations of a job
+        /// (both <c>jobs.get</c> and <c>jobs.getQueryResults</c> advance it). The last entry repeats
+        /// indefinitely, so a script of "RUNNING" models a job that never completes, and
+        /// "RUNNING", "RUNNING", "DONE" models one that completes on the third observation.
+        /// Applies to jobs created after it is set; defaults to a single "DONE".
+        /// </summary>
+        public IReadOnlyList<string> JobStateScript
+        {
+            get => _jobStateScript;
+            set
+            {
+                if (value == null || value.Count == 0)
+                {
+                    throw new ArgumentException("The job state script must contain at least one state.", nameof(value));
+                }
+
+                _jobStateScript = value.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// How long <c>jobs.getQueryResults</c> holds a request open before reporting an incomplete
+        /// job, capped by the timeoutMs the client asked for. Real BigQuery long-polls here;
+        /// responding immediately would spin the client in a tight request loop. Defaults to 100ms.
+        /// </summary>
+        public TimeSpan IncompleteQueryResultsDelay { get; set; } = TimeSpan.FromMilliseconds(100);
+
+        public string? LastRestUserAgent { get; private set; }
+        public string? LastGrpcUserAgent { get; private set; }
+
+        /// <summary>
+        /// The location given to a job created without one, as BigQuery infers it from the query's
+        /// datasets. Defaults to null, which means "US". As in BigQuery, requests for a job outside the
+        /// US and EU multi-regions must name its location, or the job is not found.
+        /// </summary>
+        public string? InferredJobLocation { get; set; }
+
+        /// <summary>Whether jobs.cancel has been called for the given job.</summary>
+        public bool IsJobCancelled(string jobId) => _jobs.TryGetValue(jobId, out MockJob? job) && job.IsCancelled;
 
         /// <summary>
         /// The mock gRPC service for configuring Storage Read API responses.
@@ -80,60 +225,233 @@ namespace AdbcDrivers.BigQuery.MockServer
         /// </summary>
         public MockBigQueryWriteService WriteService { get; }
 
+        /// <summary>The request encoding and first gRPC message's framing, before decompression.</summary>
+        public ConcurrentQueue<(string Encoding, bool Compressed, int MessageBytes)> AppendTransportRequests { get; } = new();
+
         /// <summary>
         /// Creates and starts a new mock BigQuery server on random loopback ports.
         /// </summary>
-        public BigQueryMockServer()
+        public BigQueryMockServer() : this(enableGrpcGzip: true) { }
+
+        /// <summary>Creates a mock server with optional support for gzip-compressed gRPC messages.</summary>
+        public BigQueryMockServer(bool enableGrpcGzip)
         {
             ReadService = new MockBigQueryReadService();
             WriteService = new MockBigQueryWriteService();
 
-            int restPort = GetFreePort();
-            int grpcPort = GetFreePort();
-
-            _restApp = BuildRestApp(restPort);
-            _grpcApp = BuildGrpcApp(grpcPort);
+            _restApp = BuildRestApp();
+            _grpcApp = BuildGrpcApp(enableGrpcGzip);
 
             _restApp.StartAsync().GetAwaiter().GetResult();
             _grpcApp.StartAsync().GetAwaiter().GetResult();
 
-            RestEndpoint = $"127.0.0.1:{restPort}";
-            GrpcEndpoint = $"127.0.0.1:{grpcPort}";
+            RestEndpoint = GetBoundEndpoint(_restApp);
+            GrpcEndpoint = GetBoundEndpoint(_grpcApp);
         }
 
-        private WebApplication BuildRestApp(int port)
+        /// <summary>
+        /// Sets <see cref="JobStateScript"/> from the given states, e.g.
+        /// <c>ScriptJobStates(JobStateRunning, JobStateRunning, JobStateDone)</c>.
+        /// </summary>
+        public void ScriptJobStates(params string[] states) => JobStateScript = states;
+
+        /// <summary>
+        /// Returns the recorded requests of the given kind, in arrival order.
+        /// </summary>
+        public IReadOnlyList<MockRequest> RequestsOfKind(MockRequestKind kind) =>
+            _requests.Where(request => request.Kind == kind).ToArray();
+
+        /// <summary>
+        /// Returns the number of recorded requests of the given kind.
+        /// </summary>
+        public int CountOfKind(MockRequestKind kind) => _requests.Count(request => request.Kind == kind);
+
+        /// <summary>
+        /// Queues an HTTP error for the next request of the given kind, in place of its normal
+        /// response. Each queued error is consumed by one matching request, in the order queued, so
+        /// queuing two errors makes the next two requests of that kind fail. Errors are checked
+        /// before any other work in the handler, so a failed request neither advances the job poll
+        /// script nor mutates server state.
+        /// </summary>
+        /// <param name="kind">
+        /// The request kind to fail. Only the job and query-results kinds are supported;
+        /// table operations already model their own 404/409 responses.
+        /// </param>
+        /// <param name="statusCode">The HTTP status to return.</param>
+        /// <param name="reason">
+        /// The BigQuery error reason, which the driver inspects independently of the status code:
+        /// "backendError", "internalError" and "rateLimitExceeded" are retryable whatever the
+        /// status. Real BigQuery pairs "rateLimitExceeded" with a 403, for example.
+        /// </param>
+        /// <param name="message">The error message, defaulting to one derived from the reason.</param>
+        public void QueueError(
+            MockRequestKind kind,
+            HttpStatusCode statusCode,
+            string reason = "backendError",
+            string? message = null)
+        {
+            if (kind is MockRequestKind.TableGet or MockRequestKind.TableInsert or MockRequestKind.TableDelete)
+            {
+                throw new ArgumentException($"Error injection is not supported for {kind}.", nameof(kind));
+            }
+
+            _queuedErrors
+                .GetOrAdd(kind, _ => new ConcurrentQueue<MockError>())
+                .Enqueue(new MockError(statusCode, reason, message ?? $"Mock server injected error: {reason}"));
+        }
+
+        /// <summary>
+        /// The number of queued errors of the given kind that no request has consumed yet. Lets a
+        /// test assert that the driver made every call the test set up an error for.
+        /// </summary>
+        public int PendingErrorCount(MockRequestKind kind) =>
+            _queuedErrors.TryGetValue(kind, out var queue) ? queue.Count : 0;
+
+        /// <summary>
+        /// Makes the next jobs.insert create its job but respond with a retryable 503, modelling a
+        /// response lost after BigQuery accepted the insert. Each call affects one more insert.
+        /// </summary>
+        public void LoseNextInsertResponse() => Interlocked.Increment(ref _lostInsertResponses);
+
+        private bool TryConsumeLostInsertResponse()
+        {
+            int remaining;
+            do
+            {
+                remaining = Volatile.Read(ref _lostInsertResponses);
+                if (remaining == 0)
+                {
+                    return false;
+                }
+            }
+            while (Interlocked.CompareExchange(ref _lostInsertResponses, remaining - 1, remaining) != remaining);
+            return true;
+        }
+
+        private async Task<bool> TryWriteQueuedErrorAsync(HttpContext ctx, MockRequestKind kind, string? jobId)
+        {
+            if (!_queuedErrors.TryGetValue(kind, out var queue) || !queue.TryDequeue(out MockError? error))
+            {
+                return false;
+            }
+
+            Record(kind, jobId);
+            await WriteErrorAsync(ctx, error).ConfigureAwait(false);
+            return true;
+        }
+
+        private static async Task WriteErrorAsync(HttpContext ctx, MockError error)
+        {
+            // Shaped so that Google.Apis populates GoogleApiException.Error, which is what the
+            // driver reads to decide whether a failure is retryable.
+            var response = new
+            {
+                error = new RequestError
+                {
+                    Code = (int)error.StatusCode,
+                    Message = error.Message,
+                    Errors = new List<SingleError>
+                    {
+                        new SingleError { Domain = "global", Reason = error.Reason, Message = error.Message },
+                    },
+                },
+            };
+
+            ctx.Response.StatusCode = (int)error.StatusCode;
+            ctx.Response.ContentType = "application/json";
+            await ctx.Response.WriteAsync(NewtonsoftJsonSerializer.Instance.Serialize(response)).ConfigureAwait(false);
+        }
+
+        private MockRequest Record(MockRequestKind kind, string? jobId = null)
+        {
+            MockRequest request = new(kind, jobId, Interlocked.Increment(ref _requestSequence) - 1, _requestAccessToken.Value);
+            _requests.Enqueue(request);
+            RequestReceived?.Invoke(request);
+            return request;
+        }
+
+        private WebApplication BuildRestApp()
         {
             var builder = WebApplication.CreateBuilder();
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(options =>
             {
-                options.Listen(IPAddress.Loopback, port, listenOptions =>
+                options.Listen(IPAddress.Loopback, 0, listenOptions =>
                 {
                     listenOptions.Protocols = HttpProtocols.Http1;
                 });
             });
 
             var app = builder.Build();
+            app.Use(async (context, next) =>
+            {
+                LastRestUserAgent = context.Request.Headers.UserAgent.ToString();
+                // Captured for Record, which runs inside the route handlers.
+                string authorization = context.Request.Headers.Authorization.ToString();
+                _requestAccessToken.Value = authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                    ? authorization.Substring("Bearer ".Length)
+                    : null;
+                await next().ConfigureAwait(false);
+            });
             MapRestRoutes(app);
             return app;
         }
 
-        private WebApplication BuildGrpcApp(int port)
+        private WebApplication BuildGrpcApp(bool enableGrpcGzip)
         {
             var builder = WebApplication.CreateBuilder();
             builder.Logging.ClearProviders();
-            builder.Services.AddGrpc();
+            builder.Services.AddGrpc(options =>
+            {
+                if (!enableGrpcGzip)
+                {
+                    // An empty provider list reinstates defaults, including gzip.
+                    options.CompressionProviders = new List<Grpc.Net.Compression.ICompressionProvider>
+                    {
+                        new Grpc.Net.Compression.DeflateCompressionProvider(CompressionLevel.Fastest)
+                    };
+                }
+            });
             builder.Services.AddSingleton(ReadService);
             builder.Services.AddSingleton(WriteService);
             builder.WebHost.ConfigureKestrel(options =>
             {
-                options.Listen(IPAddress.Loopback, port, listenOptions =>
+                options.Listen(IPAddress.Loopback, 0, listenOptions =>
                 {
                     listenOptions.Protocols = HttpProtocols.Http2;
                 });
             });
 
             var app = builder.Build();
+            app.Use(async (context, next) =>
+            {
+                LastGrpcUserAgent = context.Request.Headers.UserAgent.ToString();
+
+                if (context.Request.Path.Value?.EndsWith("/AppendRows", StringComparison.Ordinal) == true)
+                {
+                    var body = context.Request.BodyReader;
+                    while (true)
+                    {
+                        var read = await body.ReadAsync(context.RequestAborted).ConfigureAwait(false);
+                        var buffer = read.Buffer;
+                        if (buffer.Length >= 5)
+                        {
+                            byte[] header = new byte[5];
+                            buffer.Slice(0, 5).CopyTo(header);
+                            AppendTransportRequests.Enqueue((
+                                context.Request.Headers["grpc-encoding"].ToString(),
+                                header[0] == 1,
+                                BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(1))));
+                            // Leave the frame untouched for the gRPC service to deserialize.
+                            body.AdvanceTo(buffer.Start, buffer.Start);
+                            break;
+                        }
+                        body.AdvanceTo(buffer.Start, buffer.End);
+                        if (read.IsCompleted) break;
+                    }
+                }
+                await next().ConfigureAwait(false);
+            });
             app.MapGrpcService<MockBigQueryReadService>();
             app.MapGrpcService<MockBigQueryWriteService>();
             return app;
@@ -145,32 +463,126 @@ namespace AdbcDrivers.BigQuery.MockServer
             // Google.Apis.Json.NewtonsoftJsonSerializer. We must return JSON
             // produced by the same serializer operating on the real model classes.
 
+            // POST /bigquery/v2/projects/{projectId}/queries - Run a synchronous query
+            app.MapPost("/bigquery/v2/projects/{projectId}/queries", async (HttpContext ctx, string projectId) =>
+            {
+                if (await TryWriteQueuedErrorAsync(ctx, MockRequestKind.JobQuery, jobId: null).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                string body = await ReadBodyAsync(ctx).ConfigureAwait(false);
+                QueryRequest? queryRequest = NewtonsoftJsonSerializer.Instance.Deserialize<QueryRequest>(body);
+                LastQueryRequest = queryRequest;
+                string? queryText = queryRequest?.Query;
+                if (queryText != null)
+                {
+                    _executedQueries.Enqueue((
+                        queryText,
+                        (IReadOnlyList<QueryParameter>?)queryRequest?.QueryParameters
+                            ?? Array.Empty<QueryParameter>()));
+                }
+
+                if (!OptionalQueryCreatesJob)
+                {
+                    Record(MockRequestKind.JobQuery);
+                    var inlineResponse = InlineQueryResponse ?? new QueryResponse
+                    {
+                        Kind = "bigquery#queryResponse",
+                        JobComplete = true,
+                        QueryId = $"mock-query-{Guid.NewGuid():N}",
+                        TotalRows = 1,
+                        Schema = new TableSchema
+                        {
+                            Fields = new[] { new TableFieldSchema { Name = "value", Type = "INTEGER", Mode = "NULLABLE" } }
+                        },
+                        Rows = new[]
+                        {
+                            new TableRow { F = new[] { new TableCell { V = "42" } } }
+                        },
+                    };
+
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(NewtonsoftJsonSerializer.Instance.Serialize(inlineResponse)).ConfigureAwait(false);
+                    return;
+                }
+
+                string jobId = $"mock-job-{Guid.NewGuid():N}";
+                var mockJob = new MockJob
+                {
+                    JobId = jobId,
+                    ProjectId = projectId,
+                    StateScript = _jobStateScript,
+                    StatementType = "SELECT",
+                    Location = queryRequest?.Location ?? InferredJobLocation ?? "US",
+                };
+                _jobs[jobId] = mockJob;
+                Record(MockRequestKind.JobQuery, jobId);
+
+                bool includesResults = OptionalQueryIncludesCompleteResults || OptionalQueryIncludesPagedResults;
+                var jobResponse = new QueryResponse
+                {
+                    Kind = "bigquery#queryResponse",
+                    JobComplete = includesResults,
+                    JobReference = new JobReference { ProjectId = projectId, JobId = jobId, Location = mockJob.Location },
+                    JobCreationReason = new JobCreationReason { Code = "LARGE_RESULTS" },
+                    PageToken = OptionalQueryIncludesPagedResults ? "next-page" : null,
+                    TotalRows = includesResults
+                        ? (OptionalQueryIncludesPagedResults ? 2UL : OptionalQueryInlineTotalRows ?? (ulong)OptionalQueryInlineRowCount)
+                        : null,
+                    Schema = includesResults
+                        ? new TableSchema
+                        {
+                            Fields = new[] { new TableFieldSchema { Name = "value", Type = OptionalQueryInlineFieldType, Mode = "NULLABLE" } }
+                        }
+                        : null,
+                    Rows = includesResults
+                        ? (OptionalQueryIncludesPagedResults
+                            ? new[] { new TableRow { F = new[] { new TableCell { V = "41" } } } }
+                            : Enumerable.Range(0, OptionalQueryInlineRowCount)
+                                .Select(_ => new TableRow { F = new[] { new TableCell { V = "42" } } })
+                                .ToArray())
+                        : null,
+                };
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(NewtonsoftJsonSerializer.Instance.Serialize(jobResponse)).ConfigureAwait(false);
+            });
+
             // POST /bigquery/v2/projects/{projectId}/jobs - Create a query job
             app.MapPost("/bigquery/v2/projects/{projectId}/jobs", async (HttpContext ctx, string projectId) =>
             {
-                string body;
-                if (string.Equals(ctx.Request.Headers["Content-Encoding"].ToString(), "gzip", StringComparison.OrdinalIgnoreCase))
+                // A failed insert creates no job, so the request is recorded without an id and
+                // the request body is never treated as an executed query.
+                if (await TryWriteQueuedErrorAsync(ctx, MockRequestKind.JobInsert, jobId: null).ConfigureAwait(false))
                 {
-                    await using var gzipStream = new GZipStream(ctx.Request.Body, CompressionMode.Decompress, leaveOpen: true);
-                    using var reader = new System.IO.StreamReader(gzipStream);
-                    body = await reader.ReadToEndAsync();
+                    return;
                 }
-                else
-                {
-                    body = await new System.IO.StreamReader(ctx.Request.Body).ReadToEndAsync();
-                }
+
+                string body = await ReadBodyAsync(ctx).ConfigureAwait(false);
 
                 Job? jobRequest = null;
                 try
                 {
                     jobRequest = NewtonsoftJsonSerializer.Instance.Deserialize<Job>(body);
+                    LastInsertedJob = jobRequest;
                 }
                 catch
                 {
                     // If deserialization fails, proceed without parsed request
                 }
 
-                string jobId = $"mock-job-{Guid.NewGuid():N}";
+                // Like BigQuery, use the client's job id when it sends one and reject a duplicate.
+                string jobId = jobRequest?.JobReference?.JobId ?? $"mock-job-{Guid.NewGuid():N}";
+                if (_jobs.ContainsKey(jobId))
+                {
+                    Record(MockRequestKind.JobInsert, jobId);
+                    await WriteErrorAsync(ctx, new MockError(
+                        HttpStatusCode.Conflict,
+                        "duplicate",
+                        $"Already Exists: Job {projectId}:{jobId}")).ConfigureAwait(false);
+                    return;
+                }
+
                 string? queryText = jobRequest?.Configuration?.Query?.Query;
                 bool createSession = jobRequest?.Configuration?.Query?.CreateSession == true;
                 string? sessionId = null;
@@ -190,16 +602,20 @@ namespace AdbcDrivers.BigQuery.MockServer
 
                 if (queryText != null)
                 {
-                    _executedQueries.Enqueue(queryText);
+                    _executedQueries.Enqueue((
+                        queryText,
+                        (IReadOnlyList<QueryParameter>?)jobRequest?.Configuration?.Query?.QueryParameters
+                            ?? Array.Empty<QueryParameter>()));
                 }
 
                 var mockJob = new MockJob
                 {
                     JobId = jobId,
                     ProjectId = projectId,
-                    Status = "DONE",
+                    StateScript = _jobStateScript,
                     StatementType = queryText?.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) == true ? "UPDATE" : "SELECT",
                     NumDmlAffectedRows = queryText?.TrimStart().StartsWith("UPDATE", StringComparison.OrdinalIgnoreCase) == true ? 2 : null,
+                    Location = jobRequest?.JobReference?.Location ?? InferredJobLocation ?? "US",
                 };
 
                 // If CreateSession is requested, generate a new session ID
@@ -215,24 +631,118 @@ namespace AdbcDrivers.BigQuery.MockServer
                 }
 
                 _jobs[jobId] = mockJob;
+                Record(MockRequestKind.JobInsert, jobId);
 
-                var job = CreateJobResource(mockJob);
+                if (TryConsumeLostInsertResponse())
+                {
+                    await WriteErrorAsync(ctx, new MockError(
+                        HttpStatusCode.ServiceUnavailable,
+                        "backendError",
+                        "Mock server lost the insert response")).ConfigureAwait(false);
+                    return;
+                }
+
+                // The insert response reports the initial state without consuming a scripted
+                // observation; only status polls advance the script.
+                var job = CreateJobResource(mockJob, mockJob.PeekState());
                 string json = NewtonsoftJsonSerializer.Instance.Serialize(job);
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsync(json);
             });
 
+            // GET /bigquery/v2/projects/{projectId}/jobs - List jobs. Like BigQuery, this covers every
+            // location, so it is how a client finds the location of a job it did not specify one for.
+            app.MapGet("/bigquery/v2/projects/{projectId}/jobs", async (HttpContext ctx, string projectId) =>
+            {
+                Record(MockRequestKind.JobList);
+
+                IEnumerable<MockJob> jobs = _jobs.Values.Where(job => job.ProjectId == projectId);
+                if (!string.IsNullOrEmpty(ctx.Request.Query["parentJobId"]))
+                {
+                    // The mock does not model child jobs of a script.
+                    jobs = Enumerable.Empty<MockJob>();
+                }
+                if (long.TryParse(ctx.Request.Query["minCreationTime"], out long minCreationTime))
+                {
+                    jobs = jobs.Where(job => job.CreatedUtc.ToUnixTimeMilliseconds() >= minCreationTime);
+                }
+
+                var response = new JobList
+                {
+                    Kind = "bigquery#jobList",
+                    Jobs = jobs
+                        .OrderByDescending(job => job.CreatedUtc)
+                        .Select(job =>
+                        {
+                            Job resource = CreateJobResource(job, job.PeekState());
+                            return new JobList.JobsData
+                            {
+                                Id = resource.Id,
+                                Kind = resource.Kind,
+                                JobReference = resource.JobReference,
+                                State = resource.Status.State,
+                                Status = resource.Status,
+                                Configuration = resource.Configuration,
+                                Statistics = resource.Statistics,
+                            };
+                        })
+                        .ToList(),
+                };
+
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(NewtonsoftJsonSerializer.Instance.Serialize(response)).ConfigureAwait(false);
+            });
+
             // GET /bigquery/v2/projects/{projectId}/jobs/{jobId} - Get job status
             app.MapGet("/bigquery/v2/projects/{projectId}/jobs/{jobId}", async (HttpContext ctx, string projectId, string jobId) =>
             {
-                if (!_jobs.TryGetValue(jobId, out var mockJob))
+                if (await TryWriteQueuedErrorAsync(ctx, MockRequestKind.JobGet, jobId).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                Record(MockRequestKind.JobGet, jobId);
+                if (!TryGetJob(ctx, jobId, out MockJob? mockJob))
                 {
                     ctx.Response.StatusCode = 404;
                     return;
                 }
 
-                var job = CreateJobResource(mockJob);
+                var job = CreateJobResource(mockJob, mockJob.NextState());
                 string json = NewtonsoftJsonSerializer.Instance.Serialize(job);
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(json);
+            });
+
+            // POST /bigquery/v2/projects/{projectId}/jobs/{jobId}/cancel - Request job cancellation
+            app.MapPost("/bigquery/v2/projects/{projectId}/jobs/{jobId}/cancel", async (HttpContext ctx, string projectId, string jobId) =>
+            {
+                if (await TryWriteQueuedErrorAsync(ctx, MockRequestKind.JobCancel, jobId).ConfigureAwait(false))
+                {
+                    return;
+                }
+
+                Record(MockRequestKind.JobCancel, jobId);
+                if (!TryGetJob(ctx, jobId, out MockJob? mockJob))
+                {
+                    ctx.Response.StatusCode = 404;
+                    var notFound = new { error = new { code = 404, message = $"Not found: Job {projectId}:{jobId}", status = "NOT_FOUND" } };
+                    await ctx.Response.WriteAsJsonAsync(notFound);
+                    return;
+                }
+
+                mockJob.Cancel();
+
+                // jobs.cancel returns the job resource wrapped in a JobCancelResponse. Cancellation is
+                // asynchronous in real BigQuery, but the returned job is already terminal here so that
+                // a subsequent poll observes the stopped state deterministically.
+                var response = new JobCancelResponse
+                {
+                    Kind = "bigquery#jobCancelResponse",
+                    Job = CreateJobResource(mockJob, JobStateDone),
+                };
+
+                string json = NewtonsoftJsonSerializer.Instance.Serialize(response);
                 ctx.Response.ContentType = "application/json";
                 await ctx.Response.WriteAsync(json);
             });
@@ -240,26 +750,105 @@ namespace AdbcDrivers.BigQuery.MockServer
             // GET /bigquery/v2/projects/{projectId}/queries/{jobId} - Get query results
             app.MapGet("/bigquery/v2/projects/{projectId}/queries/{jobId}", async (HttpContext ctx, string projectId, string jobId) =>
             {
+                // Checked before the counter and the poll script advance, so an injected error
+                // does not consume a scripted job-state observation.
+                if (await TryWriteQueuedErrorAsync(ctx, MockRequestKind.QueryResults, jobId).ConfigureAwait(false))
+                {
+                    return;
+                }
+
                 Interlocked.Increment(ref _queryResultsRequestCount);
-                if (!_jobs.TryGetValue(jobId, out var mockJob))
+                LastQueryResultsPageToken = ctx.Request.Query["pageToken"];
+                Record(MockRequestKind.QueryResults, jobId);
+                if (!TryGetJob(ctx, jobId, out MockJob? mockJob))
                 {
                     ctx.Response.StatusCode = 404;
+                    return;
+                }
+
+                var jobReference = new JobReference { ProjectId = projectId, JobId = jobId, Location = mockJob.Location };
+
+                if (mockJob.NextState() != JobStateDone)
+                {
+                    await DelayForIncompleteResultsAsync(ctx).ConfigureAwait(false);
+
+                    var pending = new GetQueryResultsResponse
+                    {
+                        Kind = "bigquery#getQueryResultsResponse",
+                        JobReference = jobReference,
+                        JobComplete = false,
+                    };
+
+                    string pendingJson = NewtonsoftJsonSerializer.Instance.Serialize(pending);
+                    ctx.Response.ContentType = "application/json";
+                    await ctx.Response.WriteAsync(pendingJson);
                     return;
                 }
 
                 var response = new GetQueryResultsResponse
                 {
                     Kind = "bigquery#getQueryResultsResponse",
-                    JobReference = new JobReference { ProjectId = projectId, JobId = jobId, Location = "US" },
+                    JobReference = jobReference,
                     JobComplete = true,
-                    TotalRows = 1,
-                    Schema = new TableSchema
+                    TotalRows = QueryResultSchema != null
+                        ? (ulong)(QueryResultRows?.Count ?? 0)
+                        : OptionalQueryIncludesPagedResults ? 2UL : QueryResultTotalRows,
+                    Schema = QueryResultSchema ?? new TableSchema
                     {
                         Fields = new[]
                         {
                             new TableFieldSchema { Name = "value", Type = "INTEGER", Mode = "NULLABLE" }
                         }
                     },
+                    Rows = QueryResultSchema != null ? QueryResultRows : null,
+                };
+
+                if (mockJob.IsCancelled)
+                {
+                    response.Errors = new List<ErrorProto> { CreateStoppedError() };
+                }
+
+                string json = NewtonsoftJsonSerializer.Instance.Serialize(response);
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(json);
+            });
+
+            // GET /bigquery/v2/projects - List projects
+            app.MapGet("/bigquery/v2/projects", async (HttpContext ctx) =>
+            {
+                Record(MockRequestKind.ProjectsList);
+
+                var response = new ProjectList
+                {
+                    Projects = _projects.Select(id => new ProjectList.ProjectsData
+                    {
+                        Id = id,
+                        ProjectReference = new ProjectReference { ProjectId = id },
+                    }).ToList(),
+                };
+
+                string json = NewtonsoftJsonSerializer.Instance.Serialize(response);
+                ctx.Response.ContentType = "application/json";
+                await ctx.Response.WriteAsync(json);
+            });
+
+            // GET /bigquery/v2/projects/{projectId}/datasets - List datasets
+            app.MapGet("/bigquery/v2/projects/{projectId}/datasets", async (HttpContext ctx, string projectId) =>
+            {
+                Record(MockRequestKind.DatasetsList);
+
+                if (!_datasets.TryGetValue(projectId, out List<string>? ids))
+                {
+                    ids = new List<string>();
+                }
+
+                var response = new DatasetList
+                {
+                    Datasets = ids.Select(id => new DatasetList.DatasetsData
+                    {
+                        Id = $"{projectId}:{id}",
+                        DatasetReference = new DatasetReference { ProjectId = projectId, DatasetId = id },
+                    }).ToList(),
                 };
 
                 string json = NewtonsoftJsonSerializer.Instance.Serialize(response);
@@ -270,6 +859,7 @@ namespace AdbcDrivers.BigQuery.MockServer
             // GET /bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId} - Get table
             app.MapGet("/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}", async (HttpContext ctx, string projectId, string datasetId, string tableId) =>
             {
+                Record(MockRequestKind.TableGet);
                 string key = $"{projectId}.{datasetId}.{tableId}";
                 if (!_tables.TryGetValue(key, out var table))
                 {
@@ -287,18 +877,8 @@ namespace AdbcDrivers.BigQuery.MockServer
             // POST /bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables - Create table
             app.MapPost("/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables", async (HttpContext ctx, string projectId, string datasetId) =>
             {
-                string body;
-                if (string.Equals(ctx.Request.Headers["Content-Encoding"].ToString(), "gzip", StringComparison.OrdinalIgnoreCase))
-                {
-                    await using var gzipStream = new GZipStream(ctx.Request.Body, CompressionMode.Decompress, leaveOpen: true);
-                    using var reader = new System.IO.StreamReader(gzipStream);
-                    body = await reader.ReadToEndAsync();
-                }
-                else
-                {
-                    using var reader = new System.IO.StreamReader(ctx.Request.Body);
-                    body = await reader.ReadToEndAsync();
-                }
+                Record(MockRequestKind.TableInsert);
+                string body = await ReadBodyAsync(ctx).ConfigureAwait(false);
                 var table = NewtonsoftJsonSerializer.Instance.Deserialize<Table>(body);
                 if (table == null)
                 {
@@ -339,6 +919,7 @@ namespace AdbcDrivers.BigQuery.MockServer
             // DELETE /bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId} - Delete table
             app.MapDelete("/bigquery/v2/projects/{projectId}/datasets/{datasetId}/tables/{tableId}", (HttpContext ctx, string projectId, string datasetId, string tableId) =>
             {
+                Record(MockRequestKind.TableDelete);
                 string key = $"{projectId}.{datasetId}.{tableId}";
                 _tables.TryRemove(key, out _);
                 ctx.Response.StatusCode = 204;
@@ -353,7 +934,70 @@ namespace AdbcDrivers.BigQuery.MockServer
             });
         }
 
-        private static Job CreateJobResource(MockJob mockJob)
+        private bool TryGetJob(HttpContext ctx, string jobId, [NotNullWhen(true)] out MockJob? job)
+        {
+            if (!_jobs.TryGetValue(jobId, out job))
+            {
+                return false;
+            }
+
+            if (job.Location.Equals("US", StringComparison.OrdinalIgnoreCase) ||
+                job.Location.Equals("EU", StringComparison.OrdinalIgnoreCase) ||
+                job.Location.Equals(ctx.Request.Query["location"].ToString(), StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            job = null;
+            return false;
+        }
+
+        private static async Task<string> ReadBodyAsync(HttpContext ctx)
+        {
+            if (string.Equals(ctx.Request.Headers["Content-Encoding"].ToString(), "gzip", StringComparison.OrdinalIgnoreCase))
+            {
+                await using var gzipStream = new GZipStream(ctx.Request.Body, CompressionMode.Decompress, leaveOpen: true);
+                using var gzipReader = new System.IO.StreamReader(gzipStream);
+                return await gzipReader.ReadToEndAsync();
+            }
+
+            using var reader = new System.IO.StreamReader(ctx.Request.Body);
+            return await reader.ReadToEndAsync();
+        }
+
+        private async Task DelayForIncompleteResultsAsync(HttpContext ctx)
+        {
+            double waitMs = IncompleteQueryResultsDelay.TotalMilliseconds;
+            if (ctx.Request.Query.TryGetValue("timeoutMs", out var rawTimeout) &&
+                int.TryParse(rawTimeout.ToString(), out int timeoutMs) &&
+                timeoutMs >= 0)
+            {
+                waitMs = Math.Min(waitMs, timeoutMs);
+            }
+
+            if (waitMs <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(waitMs), ctx.RequestAborted).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The client gave up (typically a cancelled statement); fall through and let the
+                // response write fail or be discarded.
+            }
+        }
+
+        private static ErrorProto CreateStoppedError() => new ErrorProto
+        {
+            Reason = "stopped",
+            Message = "Job execution was cancelled: User requested cancellation",
+        };
+
+        private static Job CreateJobResource(MockJob mockJob, string state)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var statistics = new JobStatistics
@@ -378,6 +1022,14 @@ namespace AdbcDrivers.BigQuery.MockServer
                 };
             }
 
+            var status = new JobStatus { State = state };
+            if (mockJob.IsCancelled && state == JobStateDone)
+            {
+                ErrorProto stopped = CreateStoppedError();
+                status.ErrorResult = stopped;
+                status.Errors = new List<ErrorProto> { stopped };
+            }
+
             return new Job
             {
                 Kind = "bigquery#job",
@@ -386,9 +1038,9 @@ namespace AdbcDrivers.BigQuery.MockServer
                 {
                     ProjectId = mockJob.ProjectId,
                     JobId = mockJob.JobId,
-                    Location = "US"
+                    Location = mockJob.Location
                 },
-                Status = new JobStatus { State = mockJob.Status },
+                Status = status,
                 Configuration = new JobConfiguration
                 {
                     Query = new JobConfigurationQuery
@@ -406,11 +1058,12 @@ namespace AdbcDrivers.BigQuery.MockServer
             };
         }
 
-        private static int GetFreePort()
+        private static string GetBoundEndpoint(WebApplication app)
         {
-            using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-            listener.Start();
-            return ((IPEndPoint)listener.LocalEndpoint).Port;
+            IServer server = app.Services.GetRequiredService<IServer>();
+            IServerAddressesFeature addresses = server.Features.Get<IServerAddressesFeature>()
+                ?? throw new InvalidOperationException("The mock server did not expose a bound address.");
+            return new Uri(addresses.Addresses.Single()).Authority;
         }
 
         public void Dispose()
@@ -423,14 +1076,56 @@ namespace AdbcDrivers.BigQuery.MockServer
             _cts.Dispose();
         }
 
-        private class MockJob
+        private sealed class MockError
         {
+            public MockError(HttpStatusCode statusCode, string reason, string message)
+            {
+                StatusCode = statusCode;
+                Reason = reason;
+                Message = message;
+            }
+
+            public HttpStatusCode StatusCode { get; }
+            public string Reason { get; }
+            public string Message { get; }
+        }
+
+        private sealed class MockJob
+        {
+            private int _observationCount;
+            private int _cancelled;
+
             public string JobId { get; set; } = string.Empty;
             public string ProjectId { get; set; } = string.Empty;
-            public string Status { get; set; } = "DONE";
+            public IReadOnlyList<string> StateScript { get; set; } = new[] { JobStateDone };
             public string? SessionId { get; set; }
             public string StatementType { get; set; } = "SELECT";
             public long? NumDmlAffectedRows { get; set; }
+            public string Location { get; set; } = "US";
+            public DateTimeOffset CreatedUtc { get; } = DateTimeOffset.UtcNow;
+
+            /// <summary>Whether jobs.cancel has been called for this job.</summary>
+            public bool IsCancelled => Volatile.Read(ref _cancelled) != 0;
+
+            /// <summary>Marks the job cancelled. Returns true if this call was the one that cancelled it.</summary>
+            public bool Cancel() => Interlocked.Exchange(ref _cancelled, 1) == 0;
+
+            /// <summary>
+            /// The state for the next status observation, advancing the script by one. The last
+            /// scripted state repeats once the script is exhausted.
+            /// </summary>
+            public string NextState()
+            {
+                int index = Interlocked.Increment(ref _observationCount) - 1;
+                return IsCancelled ? JobStateDone : StateScript[Math.Min(index, StateScript.Count - 1)];
+            }
+
+            /// <summary>The state the next observation would report, without advancing the script.</summary>
+            public string PeekState()
+            {
+                int index = Volatile.Read(ref _observationCount);
+                return IsCancelled ? JobStateDone : StateScript[Math.Min(index, StateScript.Count - 1)];
+            }
         }
     }
 }
